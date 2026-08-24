@@ -102,6 +102,8 @@
 #include "bs.inc"		; HobbyKing BlueSeries / Mystery (INT0 PWM)
 #elif defined(bs_nfet_esc)
 #include "bs_nfet.inc"		; HobbyKing BlueSeries / Mystery with all nFETs (INT0 PWM)
+#elif defined(ka_nfet_esc)
+#include "ka_nfet.inc"		; KA custom nFET ESC (INT0 PWM, I2C, UART)
 #elif defined(bs40a_esc)
 #include "bs40a.inc"		; HobbyKing BlueSeries / Mystery 40A (INT0 PWM)
 #elif defined(dlu40a_esc)
