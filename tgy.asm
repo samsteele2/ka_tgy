@@ -162,6 +162,10 @@
 
 .equ	CPU_MHZ		= F_CPU / 1000000
 
+.if !defined(INDEX_ENABLE)
+.equ	INDEX_ENABLE	= 0	; Post-flight AS5600 indexing is board-specific
+.endif
+
 .equ	BOOT_LOADER	= 1	; Include Turnigy USB linker STK500v2 boot loader on PWM input pin
 .equ	BOOT_JUMP	= 1	; Jump to any boot loader when PWM input stays high
 .equ	BOOT_START	= THIRDBOOTSTART
@@ -395,6 +399,42 @@ i2c_max_pwm:	.byte	1	; MaxPWM for MK (NOTE: 250 while stopped is magic and enabl
 i2c_rx_state:	.byte	1
 i2c_blc_offset:	.byte	1
 .endif
+.if INDEX_ENABLE
+index_state:	.byte	1	; Post-run index state bits (definitions below)
+index_wait_l:	.byte	1	; 4.096 ms Timer1-overflow ticks since throttle went low
+index_wait_h:	.byte	1
+index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
+index_angle_h:	.byte	1
+index_target_frac: .byte 1	; Q8 fractional part of the 15 RPM position target
+index_target_l:	.byte	1	; Slew-limited mechanical target, 0..4095
+index_target_h:	.byte	1
+index_error_l:	.byte	1	; Signed wrapped target-minus-measured error
+index_error_h:	.byte	1
+index_electrical_l: .byte 1	; Rotor electrical angle, 0..4095
+index_electrical_h: .byte 1
+index_voltage_l: .byte 1	; Requested q-axis voltage-vector angle, 0..4095
+index_voltage_h: .byte 1
+index_q_command: .byte 1	; Calibrated vector direction: -1, 0, or +1
+index_vector_sector: .byte 1	; Nearest six-step active vector, 0..5
+index_pwm_vector: .byte 1	; Currently energized vector, or 0xff when off
+index_cal_state: .byte 1	; Automatic electrical-calibration phase
+index_cal_ticks_l: .byte 1	; Service ticks within the current phase
+index_cal_ticks_h: .byte 1
+index_cal_field_l: .byte 1	; Commanded stationary/swept electrical field
+index_cal_field_h: .byte 1
+index_cal_previous_l: .byte 1 ; Previous AS5600 sample for unwrap
+index_cal_previous_h: .byte 1
+index_cal_start_l: .byte 1	; Settled mechanical position at field angle zero
+index_cal_start_h: .byte 1
+index_cal_travel_l: .byte 1	; Signed unwrapped travel for the current sweep
+index_cal_travel_h: .byte 1
+index_cal_forward_l: .byte 1	; Signed forward-sweep travel
+index_cal_forward_h: .byte 1
+index_cal_duty_l: .byte 1	; Low-side Timer2 on-time used during calibration
+index_cal_duty_h: .byte 1
+index_cal_baseline_l: .byte 1 ; Encoder position before breakaway test
+index_cal_baseline_h: .byte 1
+.endif
 motor_count:	.byte	1	; Motor number for serial control
 brake_sub:	.byte	1	; Brake speed subtrahend (power of two)
 brake_want:	.byte	1	; Type of brake desired
@@ -418,6 +458,18 @@ blc_templimit:	.byte	1	; BLConfig temperature limit
 blc_currscale:	.byte	1	; BLConfig current scaling
 blc_bitconfig:	.byte	1	; BLConfig bitconfig (1 == MOTOR_REVERSE)
 blc_checksum:	.byte	1	; BLConfig checksum (0xaa + above bytes)
+.endif
+.if INDEX_ENABLE
+index_home_l:	.byte	1	; Calibrated AS5600 mechanical home, low byte
+index_home_h:	.byte	1	; Calibrated AS5600 mechanical home, high byte (0..15)
+index_home_valid: .byte 1	; INDEX_HOME_MARKER when home was successfully captured
+index_electrical_offset_l: .byte 1 ; Automatically calibrated electrical offset
+index_electrical_offset_h: .byte 1
+index_pole_pairs: .byte 1	; Automatically measured motor pole-pair count
+index_encoder_reverse: .byte 1	; 0: counts follow field sweep, 1: counts are reversed
+index_pwm_duty_l: .byte 1	; Learned low-side breakaway duty (Timer2 cycles)
+index_pwm_duty_h: .byte 1
+index_electrical_valid: .byte 1	; Written last as the calibration commit marker
 .endif
 eeprom_end:	.byte	1
 ;-----bko-----------------------------------------------------------------
@@ -482,6 +534,9 @@ eeprom_defaults_w:
 	.db 255, 255		; PwmScaling, CurrentLimit
 	.db 127, 0		; TempLimit, CurrentScaling
 	.db 0, byte1(0xaa + BL_REVISION + 144 + 255 + 255 + 127 + 0 + 0)	; BitConfig, crc (0xaa + sum of above bytes)
+.endif
+.if INDEX_ENABLE
+	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 .endif
 
 ;-- Instruction extension macros -----------------------------------------
@@ -1544,6 +1599,25 @@ t1ovfl_int:	in	i_sreg, SREG
 		lds	i_temp1, tcnt1x
 		inc	i_temp1
 		sts	tcnt1x, i_temp1
+		.if INDEX_ENABLE
+		lds	i_temp2, index_state
+		sbrs	i_temp2, INDEX_WAITING
+		rjmp	t1ovfl_index_done
+		lds	i_temp2, index_wait_l
+		inc	i_temp2
+		sts	index_wait_l, i_temp2
+		brne	t1ovfl_index_done
+		lds	i_temp2, index_wait_h
+		inc	i_temp2
+		sts	index_wait_h, i_temp2
+t1ovfl_index_done:
+		lds	i_temp2, index_state
+		sbrs	i_temp2, INDEX_ACTIVE
+		rjmp	t1ovfl_control_done
+		ori	i_temp2, (1<<INDEX_CONTROL_DUE)
+		sts	index_state, i_temp2
+t1ovfl_control_done:
+		.endif
 		.if BEACON_IDLE
 		brne	t1ovfl_int0
 		lds	i_temp2, idle_beacon
@@ -2456,6 +2530,12 @@ rc_prog6:	wdr
 		rcall	lsl_temp567		; Multiply by 8 (so that 32 loops makes average*256)
 		st	Y+, temp6		; Save the top 16 bits as the result
 		st	Y+, temp7
+		.if INDEX_ENABLE
+		cpi	YL, low(puls_low_l+2)	; Low endpoint was just captured
+		brne	rc_prog_home_capture_done
+		rcall	index_calibrate_home
+rc_prog_home_capture_done:
+		.endif
 	; One beep: high (full speed) pulse received
 		rcall	beep_f3
 		cpi	YL, low(puls_high_l+2)
@@ -3209,6 +3289,1172 @@ i2c_init:
 		ret
 .endif
 ;-----bko-----------------------------------------------------------------
+.if INDEX_ENABLE
+	; Indexing is deliberately reachable only after start_from_running has
+	; armed it. control_disarm clears the latch, which prevents startup indexing.
+index_disarm:	sts	index_state, ZH
+		sts	index_wait_l, ZH
+		sts	index_wait_h, ZH
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		out	TWCR, ZH
+		ret
+
+	; Carry clear means that a valid home was captured during throttle
+	; calibration. An uncalibrated home never permits indexing to start.
+index_home_is_valid:
+		lds	temp1, index_home_valid
+		cpi	temp1, INDEX_HOME_MARKER
+		brne	index_home_invalid
+		lds	temp1, index_home_h
+		cpi	temp1, 0x10
+		brsh	index_home_invalid
+		clc
+		ret
+index_home_invalid:
+		sec
+		ret
+
+	; Carry clear means that the automatically measured direction, pole-pair
+	; count, and electrical offset form a complete committed EEPROM record.
+index_electrical_is_valid:
+		lds	temp1, index_electrical_valid
+		cpi	temp1, INDEX_ELECTRICAL_MARKER
+		brne	index_electrical_invalid
+		lds	temp1, index_electrical_offset_h
+		cpi	temp1, 0x10
+		brsh	index_electrical_invalid
+		lds	temp1, index_pole_pairs
+		tst	temp1
+		breq	index_electrical_invalid
+		cpi	temp1, INDEX_CAL_MAX_POLE_PAIRS + 1
+		brsh	index_electrical_invalid
+		lds	temp1, index_encoder_reverse
+		cpi	temp1, 2
+		brsh	index_electrical_invalid
+		lds	temp1, index_pwm_duty_l
+		lds	temp2, index_pwm_duty_h
+		cpi	temp1, low(INDEX_CAL_DUTY_MIN)
+		ldi	temp3, high(INDEX_CAL_DUTY_MIN)
+		cpc	temp2, temp3
+		brcs	index_electrical_invalid
+		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
+		ldi	temp3, high(INDEX_CAL_DUTY_MAX + 1)
+		cpc	temp2, temp3
+		brcc	index_electrical_invalid
+		clc
+		ret
+index_electrical_invalid:
+		sec
+		ret
+
+	; Called only after the low-throttle calibration value has been stored in
+	; RAM and immediately before the shared EEPROM commit. Capture the AS5600
+	; angle as the mechanical home; an absent encoder invalidates any old home.
+index_calibrate_home:
+		ldi	temp1, 0xff		; A new installation/home capture requires a fresh motor calibration
+		sts	index_electrical_valid, temp1
+		rcall	index_as5600_read
+		brcs	index_calibrate_home_invalid
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_home_l, temp1
+		sts	index_home_h, temp2
+		ldi	temp1, INDEX_HOME_MARKER
+		sts	index_home_valid, temp1
+		rjmp	index_calibrate_home_done
+index_calibrate_home_invalid:
+		ldi	temp1, 0xff
+		sts	index_home_l, temp1
+		sts	index_home_h, temp1
+		sts	index_home_valid, temp1
+index_calibrate_home_done:
+		.if USE_I2C
+		rcall	i2c_init		; Restore normal SimonK I2C slave reception
+		.endif
+		ret
+
+index_run_enter:
+		ldi	temp1, (1<<INDEX_ARMED)
+		sts	index_state, temp1
+		sts	index_wait_l, ZH
+		sts	index_wait_h, ZH
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		out	TWCR, ZH
+		ret
+
+index_stop_enter:
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_ARMED
+		ret
+		andi	temp1, (1<<INDEX_ARMED)
+		ori	temp1, (1<<INDEX_WAITING)
+		sts	index_state, temp1
+		sts	index_wait_l, ZH
+		sts	index_wait_h, ZH
+		out	TWCR, ZH
+		ret
+
+	; Called only after evaluate_rc returned a valid zero-duty command. Before
+	; the delay expires this is a cheap comparison. The first successful sample
+	; starts the fixed-rate control service. Missing hardware leaves all FETs off
+	; and returns; no TWI operation can wait indefinitely.
+index_poll:	lds	temp1, index_state
+		sbrs	temp1, INDEX_WAITING
+		ret
+		sbrc	temp1, INDEX_ACTIVE
+		ret
+		lds	temp1, index_wait_l
+		lds	temp2, index_wait_h
+		cpi	temp1, low(INDEX_DELAY_OVF)
+		sbci	temp2, high(INDEX_DELAY_OVF)
+		brcs	index_poll_ret
+		rcall	index_as5600_read
+		brcs	index_sensor_fault
+		rcall	index_home_is_valid
+		brcs	index_home_missing
+		rcall	index_electrical_is_valid
+		brcc	index_home_begin
+		rjmp	index_calibration_start
+index_home_begin:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_CALIBRATING)-(1<<INDEX_PWM_RUNNING)
+		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)
+		sts	index_state, temp1
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_target_l, temp1
+		sts	index_target_h, temp2
+		sts	index_target_frac, ZH
+		sts	index_q_command, ZH
+		.if INDEX_DRIVE_ENABLE
+		rcall	index_six_step_update
+		.endif
+index_poll_ret:
+		ret
+index_sensor_fault:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
+		sts	index_state, temp1
+		rcall	switch_power_off
+		rcall	beep_f1			; AS5600 missing/unresponsive after stop delay
+		rcall	wait30ms
+		rcall	beep_f1
+		ret
+index_home_missing:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_WAITING)
+		sts	index_state, temp1
+		rcall	switch_power_off
+		rcall	beep_f1			; Home was not captured during throttle calibration
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		ret
+
+	; Timer1 requests this service every 4096 us while indexing is active.
+	; Throttle evaluation runs before this routine, so a new power command wins.
+index_service:
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_ACTIVE
+		ret
+		sbrs	temp1, INDEX_CONTROL_DUE
+		ret
+		andi	temp1, 0xff-(1<<INDEX_CONTROL_DUE)
+		sts	index_state, temp1
+		rcall	index_as5600_read
+		brcs	index_sensor_fault
+		lds	temp1, index_state
+		ori	temp1, (1<<INDEX_ANGLE_VALID)
+		sts	index_state, temp1
+		sbrc	temp1, INDEX_CALIBRATING
+		rjmp	index_calibration_step
+		rcall	index_position_step
+		.if INDEX_DRIVE_ENABLE
+		rcall	index_six_step_update
+		.endif
+		ret
+
+	; Advance a Q8 mechanical target toward home by 4.195 encoder counts per
+	; 4.096 ms update. This is 15.004 RPM and follows the shortest circular path.
+index_position_step:
+		lds	temp3, index_target_l
+		lds	temp4, index_target_h
+		lds	temp1, index_home_l
+		lds	temp2, index_home_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		andi	temp2, 0x0f		; Wrap difference modulo one mechanical turn
+		sbrs	temp2, 3
+		rjmp	index_slew_positive
+		ori	temp2, 0xf0		; Sign-extend the 12-bit negative difference
+
+index_slew_negative:
+		; Magnitude <= ceil(step) snaps exactly to home without overshoot.
+		movw	YL, temp1
+		com	YH
+		neg	YL
+		sbci	YH, 0xff
+		cpi	YH, 0
+		brne	index_slew_subtract
+		cpi	YL, 5
+		brlo	index_slew_home
+		breq	index_slew_home
+index_slew_subtract:
+		lds	temp1, index_target_frac
+		ldi	temp2, low(INDEX_SLEW_STEP_Q8)
+		sub	temp1, temp2
+		sts	index_target_frac, temp1
+		ldi	temp2, high(INDEX_SLEW_STEP_Q8)
+		sbc	temp3, temp2
+		sbc	temp4, ZH
+		andi	temp4, 0x0f
+		rjmp	index_slew_store
+
+index_slew_positive:
+		or	temp1, temp2
+		breq	index_slew_home
+		cpi	temp2, 0
+		brne	index_slew_add
+		cpi	temp1, 5
+		brlo	index_slew_home
+		breq	index_slew_home
+index_slew_add:
+		lds	temp1, index_target_frac
+		ldi	temp2, low(INDEX_SLEW_STEP_Q8)
+		add	temp1, temp2
+		sts	index_target_frac, temp1
+		ldi	temp2, high(INDEX_SLEW_STEP_Q8)
+		adc	temp3, temp2
+		adc	temp4, ZH
+		andi	temp4, 0x0f
+		rjmp	index_slew_store
+
+index_slew_home:
+		lds	temp3, index_home_l
+		lds	temp4, index_home_h
+		sts	index_target_frac, ZH
+index_slew_store:
+		sts	index_target_l, temp3
+		sts	index_target_h, temp4
+
+	; Signed shortest target-minus-measured position error.
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrc	temp4, 3
+		ori	temp4, 0xf0
+		sts	index_error_l, temp3
+		sts	index_error_h, temp4
+
+	; Six-step mode uses the calibrated breakaway duty whenever torque is
+	; required. The encoder error supplies direction only; inside the final
+	; two-count window every FET is turned off.
+		clr	YL			; YL = sign flag
+		sbrs	temp4, 7
+		rjmp	index_q_magnitude
+		inc	YL
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_q_magnitude:
+		tst	temp4
+		brne	index_q_nonzero
+		cpi	temp3, INDEX_POSITION_TOLERANCE + 1
+		brcs	index_q_zero
+index_q_nonzero:
+		ldi	temp3, 1
+		tst	YL
+		breq	index_q_encoder_direction
+		neg	temp3
+index_q_encoder_direction:
+		; Vector order is the calibration field direction. If increasing vectors
+		; made raw encoder counts fall, invert the raw position-error direction.
+		lds	temp1, index_encoder_reverse
+		tst	temp1
+		breq	index_q_store
+		neg	temp3
+		rjmp	index_q_store
+index_q_zero:
+		clr	temp3
+index_q_store:
+		sts	index_q_command, temp3
+		tst	temp3
+		brne	index_position_electrical
+		; A zero torque request while the slew target is still moving is only a
+		; coast interval. Once the target itself equals home, latch completion:
+		; stop PWM, stop AS5600 polling, and do not apply holding corrections.
+		lds	temp1, index_target_l
+		lds	temp2, index_target_h
+		lds	temp3, index_home_l
+		lds	temp4, index_home_h
+		cp	temp1, temp3
+		cpc	temp2, temp4
+		brne	index_position_electrical
+		rcall	index_home_complete
+		ret
+
+	; Convert mechanical encoder angle using the automatically calibrated
+	; direction, pole-pair count, and electrical offset stored in EEPROM.
+index_position_electrical:
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		clr	temp1
+		clr	temp2
+		lds	YL, index_pole_pairs
+		tst	YL
+		breq	index_electrical_unavailable
+index_electrical_add:
+		add	temp1, temp3
+		adc	temp2, temp4
+		dec	YL
+		brne	index_electrical_add
+		andi	temp2, 0x0f
+		lds	YL, index_encoder_reverse
+		tst	YL
+		breq	index_electrical_direction_done
+		clr	temp3
+		clr	temp4
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		movw	temp1, temp3
+		andi	temp2, 0x0f
+index_electrical_direction_done:
+		lds	temp3, index_electrical_offset_l
+		lds	temp4, index_electrical_offset_h
+		add	temp1, temp3
+		adc	temp2, temp4
+		andi	temp2, 0x0f
+		rjmp	index_electrical_store
+index_electrical_unavailable:
+		clr	temp1
+		clr	temp2
+		sts	index_q_command, ZH
+index_electrical_store:
+		sts	index_electrical_l, temp1
+		sts	index_electrical_h, temp2
+
+	; Place the requested six-step torque vector +/-90 electrical degrees from
+	; rotor flux according to the sign of the position error.
+		lds	temp3, index_q_command
+		tst	temp3
+		breq	index_voltage_store
+		brmi	index_voltage_negative
+		subi	temp1, low(-1024)
+		sbci	temp2, high(-1024)
+		rjmp	index_voltage_wrap
+index_voltage_negative:
+		subi	temp1, low(1024)
+		sbci	temp2, high(1024)
+index_voltage_wrap:
+		andi	temp2, 0x0f
+index_voltage_store:
+		sts	index_voltage_l, temp1
+		sts	index_voltage_h, temp2
+		rcall	index_angle_to_vector
+		ret
+
+	; Reduce the voltage angle to the nearest of six active vectors. Rounding
+	; at half a 683-count sector provides conventional sensored six-step
+	; commutation while the AS5600 supplies the rotor angle.
+index_angle_to_vector:
+		clr	temp3
+index_sector_loop:
+		cpi	temp2, high(683)
+		brlo	index_sector_done
+		brne	index_sector_sub
+		cpi	temp1, low(683)
+		brlo	index_sector_done
+index_sector_sub:
+		subi	temp1, low(683)
+		sbci	temp2, high(683)
+		inc	temp3
+		cpi	temp3, 5
+		brlo	index_sector_loop
+index_sector_done:
+		cpi	temp2, high(342)
+		brlo	index_sector_rounded
+		brne	index_sector_round_up
+		cpi	temp1, low(342)
+		brlo	index_sector_rounded
+index_sector_round_up:
+		inc	temp3
+		cpi	temp3, 6
+		brlo	index_sector_rounded
+		clr	temp3
+index_sector_rounded:
+		sts	index_vector_sector, temp3
+		ret
+
+	; Home is a terminal state for this stopped cycle. Keep only the post-run
+	; armed latch; a later accepted throttle command starts normal SimonK and
+	; rearms the next high-to-low indexing event.
+index_home_complete:
+		rcall	switch_power_off
+		lds	temp1, index_state
+		andi	temp1, (1<<INDEX_ARMED)
+		sts	index_state, temp1
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		out	TWCR, ZH
+		ret
+
+	; Begin a one-time automatic calibration when a valid mechanical home exists
+	; but the motor/encoder electrical relationship has not been committed.
+	; Vector zero is established first. Vector one is then used to learn the
+	; minimum low-side PWM duty that produces verified encoder movement.
+index_calibration_start:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
+		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)|(1<<INDEX_CALIBRATING)
+		sts	index_state, temp1
+		ldi	temp1, INDEX_CAL_BASE_HOLD
+		sts	index_cal_state, temp1
+		ldi2	temp1, temp2, INDEX_CAL_DUTY_MIN
+		sts	index_cal_duty_l, temp1
+		sts	index_cal_duty_h, temp2
+		sts	index_cal_ticks_l, ZH
+		sts	index_cal_ticks_h, ZH
+		sts	index_cal_field_l, ZH
+		sts	index_cal_field_h, ZH
+		sts	index_cal_travel_l, ZH
+		sts	index_cal_travel_h, ZH
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_cal_previous_l, temp1
+		sts	index_cal_previous_h, temp2
+		sts	index_cal_baseline_l, temp1
+		sts	index_cal_baseline_h, temp2
+		rcall	index_calibration_publish
+		ret
+
+	; Publish the nearest six-step vector for the direct calibration field.
+	; The rotor is expected to settle at each discrete vector.
+index_calibration_publish:
+		lds	temp1, index_cal_field_l
+		lds	temp2, index_cal_field_h
+		sts	index_voltage_l, temp1
+		sts	index_voltage_h, temp2
+		rcall	index_angle_to_vector
+		.if INDEX_DRIVE_ENABLE
+		lds	temp1, index_vector_sector
+		lds	temp2, index_cal_duty_l
+		lds	temp3, index_cal_duty_h
+		rcall	index_six_step_drive
+		.endif
+		ret
+
+	; Add the shortest signed delta from the latest AS5600 sample to the current
+	; unwrapped sweep travel and make this sample the next reference point.
+index_calibration_accumulate:
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		lds	temp1, index_cal_previous_l
+		lds	temp2, index_cal_previous_h
+		sts	index_cal_previous_l, temp3
+		sts	index_cal_previous_h, temp4
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrc	temp4, 3
+		ori	temp4, 0xf0
+		lds	temp1, index_cal_travel_l
+		lds	temp2, index_cal_travel_h
+		add	temp1, temp3
+		adc	temp2, temp4
+		sts	index_cal_travel_l, temp1
+		sts	index_cal_travel_h, temp2
+		ret
+
+	; Non-blocking 244 Hz calibration service. A positive and negative complete
+	; electrical revolution provide encoder direction, pole-pair count, and
+	; agreement checks before any result is allowed into EEPROM.
+index_calibration_step:
+		lds	temp1, index_cal_state
+		cpi	temp1, INDEX_CAL_BASE_HOLD
+		brne	index_cal_not_base
+		rjmp	index_calibration_base_hold
+index_cal_not_base:
+		cpi	temp1, INDEX_CAL_BREAKAWAY
+		brne	index_cal_not_breakaway
+		rjmp	index_calibration_breakaway
+index_cal_not_breakaway:
+		cpi	temp1, INDEX_CAL_ALIGN_HOLD
+		brne	index_cal_not_align
+		rjmp	index_calibration_align_hold
+index_cal_not_align:
+		cpi	temp1, INDEX_CAL_SWEEP_FORWARD
+		brne	index_cal_not_forward
+		rjmp	index_calibration_sweep_forward
+index_cal_not_forward:
+		cpi	temp1, INDEX_CAL_FORWARD_HOLD
+		brne	index_cal_not_forward_hold
+		rjmp	index_calibration_forward_hold
+index_cal_not_forward_hold:
+		cpi	temp1, INDEX_CAL_SWEEP_REVERSE
+		brne	index_cal_not_reverse
+		rjmp	index_calibration_sweep_reverse
+index_cal_not_reverse:
+		cpi	temp1, INDEX_CAL_FINAL_HOLD
+		breq	index_cal_final_state
+		rjmp	index_calibration_failed
+index_cal_final_state:
+		rjmp	index_calibration_final_hold
+
+	; Hold vector zero briefly at the normal SimonK minimum pulse width, then
+	; step to vector one and ramp only the low-side duty until the encoder proves
+	; that the rotor has crossed the magnetic detent.
+index_calibration_base_hold:
+		lds	temp1, index_cal_ticks_l
+		inc	temp1
+		cpi	temp1, INDEX_CAL_BASE_HOLD_TICKS
+		brsh	index_calibration_base_done
+		sts	index_cal_ticks_l, temp1
+		ret
+index_calibration_base_done:
+		sts	index_cal_ticks_l, ZH
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_cal_baseline_l, temp1
+		sts	index_cal_baseline_h, temp2
+		ldi2	temp1, temp2, 683
+		sts	index_cal_field_l, temp1
+		sts	index_cal_field_h, temp2
+		ldi	temp1, INDEX_CAL_BREAKAWAY
+		sts	index_cal_state, temp1
+		rjmp	index_calibration_publish
+
+index_calibration_breakaway:
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		lds	temp1, index_cal_baseline_l
+		lds	temp2, index_cal_baseline_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrs	temp4, 3
+		rjmp	index_calibration_breakaway_abs
+		ori	temp4, 0xf0
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_calibration_breakaway_abs:
+		tst	temp4
+		brne	index_calibration_breakaway_found
+		cpi	temp3, INDEX_CAL_MOVE_COUNTS
+		brsh	index_calibration_breakaway_found
+
+		lds	temp1, index_cal_ticks_l
+		inc	temp1
+		cpi	temp1, INDEX_CAL_RAMP_STEP_TICKS
+		brsh	index_calibration_breakaway_ramp
+		sts	index_cal_ticks_l, temp1
+		ret
+index_calibration_breakaway_ramp:
+		sts	index_cal_ticks_l, ZH
+		lds	temp1, index_cal_duty_l
+		lds	temp2, index_cal_duty_h
+		cpi	temp1, low(INDEX_CAL_DUTY_MAX)
+		ldi	temp3, high(INDEX_CAL_DUTY_MAX)
+		cpc	temp2, temp3
+		brlo	index_calibration_breakaway_raise
+		rjmp	index_calibration_failed
+index_calibration_breakaway_raise:
+		subi	temp1, low(-INDEX_CAL_DUTY_STEP)
+		sbci	temp2, high(-INDEX_CAL_DUTY_STEP)
+		sts	index_cal_duty_l, temp1
+		sts	index_cal_duty_h, temp2
+		rjmp	index_calibration_publish
+
+index_calibration_breakaway_found:
+		lds	temp1, index_cal_duty_l
+		lds	temp2, index_cal_duty_h
+		subi	temp1, low(-INDEX_CAL_DUTY_MARGIN)
+		sbci	temp2, high(-INDEX_CAL_DUTY_MARGIN)
+		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
+		ldi	temp3, high(INDEX_CAL_DUTY_MAX + 1)
+		cpc	temp2, temp3
+		brlo	index_calibration_breakaway_store
+		ldi2	temp1, temp2, INDEX_CAL_DUTY_MAX
+index_calibration_breakaway_store:
+		sts	index_cal_duty_l, temp1
+		sts	index_cal_duty_h, temp2
+		sts	index_pwm_duty_l, temp1
+		sts	index_pwm_duty_h, temp2
+		sts	index_cal_field_l, ZH
+		sts	index_cal_field_h, ZH
+		sts	index_cal_ticks_l, ZH
+		ldi	temp1, INDEX_CAL_ALIGN_HOLD
+		sts	index_cal_state, temp1
+		rjmp	index_calibration_publish
+
+index_calibration_align_hold:
+		lds	temp1, index_cal_ticks_l
+		inc	temp1
+		cpi	temp1, INDEX_CAL_ALIGN_HOLD_TICKS
+		brsh	index_calibration_align_done
+		sts	index_cal_ticks_l, temp1
+		ret
+index_calibration_align_done:
+		sts	index_cal_ticks_l, ZH
+		sts	index_cal_ticks_h, ZH
+		sts	index_cal_travel_l, ZH
+		sts	index_cal_travel_h, ZH
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_cal_start_l, temp1
+		sts	index_cal_start_h, temp2
+		sts	index_cal_previous_l, temp1
+		sts	index_cal_previous_h, temp2
+		ldi	temp1, INDEX_CAL_SWEEP_FORWARD
+		sts	index_cal_state, temp1
+		ret
+
+index_calibration_sweep_forward:
+		rcall	index_calibration_accumulate
+		lds	temp3, index_cal_field_l
+		lds	temp4, index_cal_field_h
+		subi	temp3, low(-INDEX_CAL_SWEEP_STEP)
+		sbci	temp4, high(-INDEX_CAL_SWEEP_STEP)
+		andi	temp4, 0x0f
+		sts	index_cal_field_l, temp3
+		sts	index_cal_field_h, temp4
+		rcall	index_calibration_tick_sweep
+		brcs	index_calibration_forward_done
+		rjmp	index_calibration_publish
+index_calibration_forward_done:
+		ldi	temp1, INDEX_CAL_FORWARD_HOLD
+		sts	index_cal_state, temp1
+		rjmp	index_calibration_publish
+
+index_calibration_forward_hold:
+		rcall	index_calibration_accumulate
+		lds	temp1, index_cal_ticks_l
+		inc	temp1
+		cpi	temp1, INDEX_CAL_END_HOLD_TICKS
+		brsh	index_calibration_forward_settled
+		sts	index_cal_ticks_l, temp1
+		ret
+index_calibration_forward_settled:
+		lds	temp1, index_cal_travel_l
+		lds	temp2, index_cal_travel_h
+		sts	index_cal_forward_l, temp1
+		sts	index_cal_forward_h, temp2
+		sts	index_cal_travel_l, ZH
+		sts	index_cal_travel_h, ZH
+		sts	index_cal_ticks_l, ZH
+		sts	index_cal_ticks_h, ZH
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_cal_previous_l, temp1
+		sts	index_cal_previous_h, temp2
+		ldi	temp1, INDEX_CAL_SWEEP_REVERSE
+		sts	index_cal_state, temp1
+		ret
+
+index_calibration_sweep_reverse:
+		rcall	index_calibration_accumulate
+		lds	temp3, index_cal_field_l
+		lds	temp4, index_cal_field_h
+		subi	temp3, low(INDEX_CAL_SWEEP_STEP)
+		sbci	temp4, high(INDEX_CAL_SWEEP_STEP)
+		andi	temp4, 0x0f
+		sts	index_cal_field_l, temp3
+		sts	index_cal_field_h, temp4
+		rcall	index_calibration_tick_sweep
+		brcs	index_calibration_reverse_done
+		rjmp	index_calibration_publish
+index_calibration_reverse_done:
+		ldi	temp1, INDEX_CAL_FINAL_HOLD
+		sts	index_cal_state, temp1
+		rjmp	index_calibration_publish
+
+	; Carry is set after exactly one 4096-count electrical revolution.
+index_calibration_tick_sweep:
+		lds	temp1, index_cal_ticks_l
+		lds	temp2, index_cal_ticks_h
+		subi	temp1, 0xff
+		sbci	temp2, 0xff
+		sts	index_cal_ticks_l, temp1
+		sts	index_cal_ticks_h, temp2
+		cpi	temp1, low(INDEX_CAL_SWEEP_TICKS)
+		brne	index_calibration_tick_more
+		cpi	temp2, high(INDEX_CAL_SWEEP_TICKS)
+		brne	index_calibration_tick_more
+		sts	index_cal_ticks_l, ZH
+		sts	index_cal_ticks_h, ZH
+		sec
+		ret
+index_calibration_tick_more:
+		clc
+		ret
+
+index_calibration_final_hold:
+		rcall	index_calibration_accumulate
+		lds	temp1, index_cal_ticks_l
+		inc	temp1
+		cpi	temp1, INDEX_CAL_END_HOLD_TICKS
+		brsh	index_calibration_validate
+		sts	index_cal_ticks_l, temp1
+		ret
+
+	; Validate return position, opposite sweep directions, travel agreement,
+	; and the integer pole-pair fit. Successful fields are written before the
+	; validity marker, so power loss cannot commit a partial calibration.
+index_calibration_validate:
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		lds	temp1, index_cal_start_l
+		lds	temp2, index_cal_start_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrs	temp4, 3
+		rjmp	index_calibration_return_positive
+		ori	temp4, 0xf0
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_calibration_return_positive:
+		tst	temp4
+		breq	index_calibration_return_high_ok
+		rjmp	index_calibration_failed
+index_calibration_return_high_ok:
+		cpi	temp3, INDEX_CAL_RETURN_TOLERANCE + 1
+		brlo	index_calibration_return_ok
+		rjmp	index_calibration_failed
+index_calibration_return_ok:
+
+		; Make forward travel positive and remember whether encoder counts fell.
+		lds	temp3, index_cal_forward_l
+		lds	temp4, index_cal_forward_h
+		clr	YL
+		sbrs	temp4, 7
+		rjmp	index_calibration_forward_absolute
+		inc	YL
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_calibration_forward_absolute:
+		sts	index_encoder_reverse, YL
+		sts	index_cal_forward_l, temp3
+		sts	index_cal_forward_h, temp4
+
+		; Reverse travel must have the opposite sign; then compare magnitudes.
+		lds	temp1, index_cal_travel_l
+		lds	temp2, index_cal_travel_h
+		tst	YL
+		brne	index_calibration_forward_was_negative
+		sbrs	temp2, 7
+		rjmp	index_calibration_failed
+		com	temp2
+		neg	temp1
+		sbci	temp2, 0xff
+		rjmp	index_calibration_reverse_absolute
+index_calibration_forward_was_negative:
+		sbrc	temp2, 7
+		rjmp	index_calibration_failed
+index_calibration_reverse_absolute:
+		sts	index_cal_travel_l, temp1
+		sts	index_cal_travel_h, temp2
+		cp	temp3, temp1
+		cpc	temp4, temp2
+		brcc	index_calibration_forward_larger
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		rjmp	index_calibration_compare_difference
+index_calibration_forward_larger:
+		movw	XL, temp3
+		sub	XL, temp1
+		sbc	XH, temp2
+		movw	temp1, XL
+index_calibration_compare_difference:
+		tst	temp2
+		breq	index_calibration_difference_high_ok
+		rjmp	index_calibration_failed
+index_calibration_difference_high_ok:
+		cpi	temp1, INDEX_CAL_TRAVEL_MATCH + 1
+		brlo	index_calibration_difference_ok
+		rjmp	index_calibration_failed
+index_calibration_difference_ok:
+		; Average the two accepted magnitudes to reduce directional load bias.
+		lds	temp3, index_cal_forward_l
+		lds	temp4, index_cal_forward_h
+		lds	temp1, index_cal_travel_l
+		lds	temp2, index_cal_travel_h
+		add	temp1, temp3
+		adc	temp2, temp4
+		lsr	temp2
+		ror	temp1
+		sts	index_cal_forward_l, temp1
+		sts	index_cal_forward_h, temp2
+
+		; Reject too little motion before estimating round(4096 / travel).
+		lds	temp3, index_cal_forward_l
+		lds	temp4, index_cal_forward_h
+		cpi	temp3, low(INDEX_CAL_MIN_TRAVEL)
+		ldi	temp1, high(INDEX_CAL_MIN_TRAVEL)
+		cpc	temp4, temp1
+		brcc	index_calibration_travel_large_enough
+		rjmp	index_calibration_failed
+index_calibration_travel_large_enough:
+		movw	XL, temp3
+		ldi	YL, 1
+index_calibration_pole_loop:
+		cpi	XH, high(4096)
+		brsh	index_calibration_pole_crossed
+		add	XL, temp3
+		adc	XH, temp4
+		inc	YL
+		cpi	YL, INDEX_CAL_MAX_POLE_PAIRS + 1
+		brlo	index_calibration_pole_loop
+		rjmp	index_calibration_failed
+index_calibration_pole_crossed:
+		subi	XL, low(4096)
+		sbci	XH, high(4096)
+		movw	temp1, XL
+		lsl	temp1
+		rol	temp2
+		cp	temp3, temp1
+		cpc	temp4, temp2
+		brcc	index_calibration_pole_selected
+		dec	YL
+index_calibration_pole_selected:
+		tst	YL
+		breq	index_calibration_failed
+		sts	index_pole_pairs, YL
+
+		; Validate pole_pairs * measured_travel against one electrical turn.
+		clr	XL
+		clr	XH
+		mov	temp1, YL
+index_calibration_fit_loop:
+		add	XL, temp3
+		adc	XH, temp4
+		dec	temp1
+		brne	index_calibration_fit_loop
+		subi	XL, low(4096)
+		sbci	XH, high(4096)
+		sbrs	XH, 7
+		rjmp	index_calibration_fit_positive
+		com	XH
+		neg	XL
+		sbci	XH, 0xff
+index_calibration_fit_positive:
+		tst	XH
+		brne	index_calibration_failed
+		cpi	XL, INDEX_CAL_POLE_FIT + 1
+		brsh	index_calibration_failed
+
+		; At the final settled field angle zero: offset = -sign*p*angle.
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		clr	XL
+		clr	XH
+		lds	YL, index_pole_pairs
+index_calibration_offset_loop:
+		add	XL, temp3
+		adc	XH, temp4
+		dec	YL
+		brne	index_calibration_offset_loop
+		andi	XH, 0x0f
+		lds	temp1, index_encoder_reverse
+		tst	temp1
+		brne	index_calibration_offset_store
+		clr	temp1
+		clr	temp2
+		sub	temp1, XL
+		sbc	temp2, XH
+		movw	XL, temp1
+		andi	XH, 0x0f
+index_calibration_offset_store:
+		sts	index_electrical_offset_l, XL
+		sts	index_electrical_offset_h, XH
+
+		rcall	switch_power_off
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
+		sts	index_state, temp1
+		ldi	temp1, INDEX_ELECTRICAL_MARKER
+		sts	index_electrical_valid, temp1
+		rcall	eeprom_write_block
+		rcall	index_as5600_read
+		brcc	index_calibration_commit_read_ok
+		rjmp	index_sensor_fault
+index_calibration_commit_read_ok:
+		rjmp	index_home_begin
+
+index_calibration_failed:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
+		sts	index_state, temp1
+		rcall	switch_power_off
+		rcall	beep_f1			; Four low pulses: electrical calibration rejected
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		ret
+
+	; Issue TWCR command in temp1 and wait for TWINT. Carry is set on timeout.
+index_twi_wait:
+		out	TWCR, temp1
+		ldi	temp2, 0xff
+index_twi_wait1:
+		wdr
+		in	temp1, TWCR
+		sbrc	temp1, TWINT
+		rjmp	index_twi_ok
+		dec	temp2
+		brne	index_twi_wait1
+		sec
+		ret
+index_twi_ok:	clc
+		ret
+
+	; Read AS5600 ANGLE (0x0e/0x0f). Result is stored in index_angle_h:l.
+	; Transaction: START, SLA+W, register, repeated START, SLA+R, two bytes.
+index_as5600_read:
+		out	TWCR, ZH		; Disable legacy slave interrupt first
+		out	TWSR, ZH		; Prescaler = 1
+		outi	TWBR, INDEX_TWBR, temp1
+
+		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x08
+		brne	index_as5600_error
+
+		outi	TWDR, INDEX_AS5600_ADDR_W, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x18
+		brne	index_as5600_error
+
+		outi	TWDR, INDEX_AS5600_ANGLE_REG, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_error
+
+		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x10
+		brne	index_as5600_error
+
+		outi	TWDR, INDEX_AS5600_ADDR_R, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x40
+		brne	index_as5600_error
+
+		ldi	temp1, (1<<TWINT)|(1<<TWEA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x50
+		brne	index_as5600_error
+		in	temp1, TWDR
+		andi	temp1, 0x0f
+		sts	index_angle_h, temp1
+
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x58
+		brne	index_as5600_error
+		in	temp1, TWDR
+		sts	index_angle_l, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
+		out	TWCR, temp1
+		clc
+		ret
+
+index_as5600_error:
+		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
+		out	TWCR, temp1
+		sec
+		ret
+
+	; Homing uses the learned low-side pulse width. The vector angle already
+	; contains the torque direction, so a zero command means coast and any
+	; nonzero command energizes the nearest sensored six-step vector.
+index_six_step_update:
+		lds	temp1, index_q_command
+		tst	temp1
+		breq	index_six_step_stop
+		lds	temp1, index_vector_sector
+		lds	temp2, index_pwm_duty_l
+		lds	temp3, index_pwm_duty_h
+		rjmp	index_six_step_drive
+
+index_six_step_stop:
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_PWM_RUNNING
+		ret
+		rcall	switch_power_off
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
+		sts	index_state, temp1
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		ret
+
+	; Input: temp1=vector 0..5, temp3:temp2=low-side on-time in Timer2 cycles.
+	; A vector transition disables Timer2, turns every FET off for 5 us, selects
+	; one stationary high-side source, waits another 5 us for its slow gate pull-
+	; up, then starts asynchronous PWM on only the low-side sink. SKIP_CPWM keeps
+	; the sink phase's complementary high-side FET off between PWM pulses.
+index_six_step_drive:
+		cpi	temp1, 6
+		brlo	index_six_step_vector_valid
+		rjmp	index_six_step_invalid
+index_six_step_vector_valid:
+		cpi	temp2, low(INDEX_CAL_DUTY_MIN)
+		ldi	temp4, high(INDEX_CAL_DUTY_MIN)
+		cpc	temp3, temp4
+		brcc	index_six_step_duty_min_valid
+		rjmp	index_six_step_invalid
+index_six_step_duty_min_valid:
+		cpi	temp2, low(INDEX_CAL_DUTY_MAX + 1)
+		ldi	temp4, high(INDEX_CAL_DUTY_MAX + 1)
+		cpc	temp3, temp4
+		brcs	index_six_step_duty_valid
+		rjmp	index_six_step_invalid
+index_six_step_duty_valid:
+		mov	XL, temp1
+		mov	YL, temp2
+		mov	YH, temp3
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_PWM_RUNNING
+		rjmp	index_six_step_change
+		lds	temp1, index_pwm_vector
+		cp	temp1, XL
+		brne	index_six_step_change
+
+		in	temp4, SREG
+		cli
+		push	temp4
+		rcall	index_six_step_timing
+		sbr	flags2, (1<<SKIP_CPWM)
+		pop	temp4
+		out	SREG, temp4
+		ret
+
+index_six_step_change:
+		in	temp4, SREG
+		cli
+		push	temp4
+		rcall	switch_power_off
+		ldi	temp1, INDEX_DEADTIME_LOOPS
+index_six_step_break_delay:
+		dec	temp1
+		brne	index_six_step_break_delay
+
+		andi	flags2, 0xff-(1<<A_FET)-(1<<B_FET)-(1<<C_FET)
+		sbr	flags2, (1<<SKIP_CPWM)
+		cpi	XL, 2
+		brlo	index_six_step_sink_b
+		cpi	XL, 4
+		brlo	index_six_step_sink_a
+		sbr	flags2, (1<<C_FET)
+		rjmp	index_six_step_source
+index_six_step_sink_a:
+		sbr	flags2, (1<<A_FET)
+		rjmp	index_six_step_source
+index_six_step_sink_b:
+		sbr	flags2, (1<<B_FET)
+
+index_six_step_source:
+		cpi	XL, 1
+		breq	index_six_step_source_c
+		cpi	XL, 2
+		breq	index_six_step_source_c
+		cpi	XL, 3
+		breq	index_six_step_source_b
+		cpi	XL, 4
+		breq	index_six_step_source_b
+		ApFET_on			; Vectors 0 and 5: A+
+		rjmp	index_six_step_source_ready
+index_six_step_source_b:
+		BpFET_on			; Vectors 3 and 4: B+
+		rjmp	index_six_step_source_ready
+index_six_step_source_c:
+		CpFET_on			; Vectors 1 and 2: C+
+index_six_step_source_ready:
+		ldi	temp1, INDEX_DEADTIME_LOOPS
+index_six_step_rise_delay:
+		dec	temp1
+		brne	index_six_step_rise_delay
+
+		sts	index_pwm_vector, XL
+		lds	temp1, index_state
+		ori	temp1, (1<<INDEX_PWM_RUNNING)
+		sts	index_state, temp1
+		rcall	index_six_step_timing
+		ldi	ZL, low(pwm_on)
+		mov	tcnt2h, ZH
+		ldi	temp1, 0xff
+		out	TCNT2, temp1
+		ldi	temp1, (1<<TOV2)
+		out	TIFR, temp1
+		outi	TCCR2, T2CLK, temp1
+		pop	temp4
+		out	SREG, temp4
+		ret
+
+	; Configure the existing SimonK Timer2 on/off ISR for asynchronous PWM.
+	; YH:YL is the requested on-time. No complementary-PWM overhead is removed
+	; because the selected high-side complement remains disabled for all frames.
+index_six_step_timing:
+		ldi2	temp1, temp2, MAX_POWER
+		sub	temp1, YL
+		sbc	temp2, YH
+		ldi	temp4, low(pwm_on)
+		cpse	temp2, ZH
+		ldi	temp4, low(pwm_on_high)
+		com	YL
+		com	temp1
+		movw	duty_l, YL
+		movw	off_duty_l, temp1
+		sts	pwm_on_ptr, temp4
+		cbr	flags1, (1<<FULL_POWER)
+		sbr	flags1, (1<<POWER_ON)
+		ret
+
+index_six_step_invalid:
+		rcall	switch_power_off
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
+		sts	index_state, temp1
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		ret
+.endif
+;-----bko-----------------------------------------------------------------
 .if BEEP_RCP_ERROR
 rcp_error_beep:
 		rcall	switch_power_off	; Brake may have been on
@@ -3386,6 +4632,9 @@ cell_blipper1:
 .endif
 
 control_disarm:
+		.if INDEX_ENABLE
+		rcall	index_disarm
+		.endif
 	; LEDs off while disarmed
 		BLUE_off
 		GRN_off
@@ -3488,6 +4737,9 @@ i_rc_puls3:
 ;-----bko-----------------------------------------------------------------
 restart_control:
 		rcall	switch_power_off	; Disables PWM timer, turns off all FETs
+		.if INDEX_ENABLE
+		rcall	index_stop_enter
+		.endif
 		cbr	flags0, (1<<SET_DUTY)	; Do not yet set duty on input
 		.if BEACON_IDLE
 		sts	idle_beacon, ZH
@@ -3535,6 +4787,9 @@ wait_for_power_on:
 		wdr
 		sbrc	flags1, EVAL_RC
 		rjmp	wait_for_power_rx
+		.if INDEX_ENABLE
+		rcall	index_service
+		.endif
 		.if BEEP_RCP_ERROR
 		sbrc	flags0, RCP_ERROR	; Check if we've seen bad PWM edges
 		rcall	rcp_error_beep
@@ -3576,9 +4831,15 @@ wait_for_power_rx:
 		breq	wait_for_power_on	; while increasing boot/beacon timers
 		adiw	YL, 0
 		brne	start_from_running	; If power requested, start; otherwise,
+		.if INDEX_ENABLE
+		rcall	index_poll
+		.endif
 		rjmp	wait_for_power_on_init	; loop while resetting boot/beacon timers
 
 start_from_running:
+		.if INDEX_ENABLE
+		rcall	index_run_enter		; Arm future indexing and cancel any active index
+		.endif
 		rcall	switch_power_off
 		comp_init temp1			; init comparator
 		RED_off

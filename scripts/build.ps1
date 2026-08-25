@@ -1,7 +1,7 @@
-# Build the KA nFET firmware on Windows. Requires AVRA 1.3.x in PATH.
+# Build the KA nFET firmware on Windows. Requires AVRA in PATH or the fallback below.
 
 $ErrorActionPreference = 'Stop'
-$repoDir = Split-Path -Parent $PSCommandPath
+$repoDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $avra = Get-Command avra -ErrorAction SilentlyContinue
 if ($null -ne $avra) {
     $avraPath = $avra.Source
@@ -11,7 +11,7 @@ else {
 }
 
 if (-not (Test-Path -LiteralPath $avraPath -PathType Leaf)) {
-    throw 'AVRA was not found. Install AVRA 1.3.x or add avra.exe to PATH, then run this script again.'
+    throw 'AVRA was not found. Follow README.md, or add avra.exe to PATH, then run this script again.'
 }
 
 Push-Location $repoDir

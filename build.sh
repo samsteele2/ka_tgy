@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the KA nFET firmware on macOS/Linux. Requires AVRA 1.3.x in PATH.
+# Build the KA nFET firmware on macOS/Linux. Requires AVRA in PATH.
 
 set -euo pipefail
 
