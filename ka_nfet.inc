@@ -26,17 +26,20 @@
 .equ	INDEX_START_DELAY_SECONDS = 5	; Coast time after throttle reaches zero
 .equ	INDEX_SLEW_RPM			= 15	; Maximum mechanical homing speed
 
-; Motion-controller tuning. P and D act on encoder counts per 4.096 ms update.
-; I acts on the final-only error accumulator after its internal /32 scaling.
-; FF is pulse-density command per target encoder-count/update (64 is nominal).
-.equ	INDEX_P_GAIN			= 1	; Tracking-error stiffness (previously 12)
-.equ	INDEX_I_GAIN			= 1	; Final static-error correction
-.equ	INDEX_D_GAIN			= 0	; Measured-motion damping (previously 16)
-.equ	INDEX_I_MAX			= 4096	; Absolute final-error accumulator clamp
+; Motion-controller tuning. P, I, and D are in sixteenths: 4 means 0.25.
+; P and D act on encoder counts per 4.096 ms update. I acts on the final-only
+; error accumulator after its internal /32 scaling. FF retains its Q8 rate scale.
+.equ	INDEX_P_GAIN			= 24 ; 1.50 tracking-error stiffness
+.equ	INDEX_I_GAIN			= 8	; 0.50 final static-error correction
+.equ	INDEX_D_GAIN			= 8	; 0.50 measured-motion damping
+.equ	INDEX_I_MAX			= 8191	; Absolute final-error accumulator clamp
 .equ	INDEX_FF_GAIN			= 0	; Target-rate feed-forward
+.equ	INDEX_STUCK_DELTA		= 3	; Max |encoder delta| considered virtually stopped
 
 ; Board-level electrical safety limits. Change these only after checking the
-; gate waveform and phase current on the actual hardware.
+; gate waveform and phase current on the actual hardware. This is a hard ceiling
+; for breakaway discovery; normal calibration and homing use only the measured
+; breakaway duty plus a small internal margin.
 .equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us low-side pulse / 16% at 20 kHz
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay around a six-step vector change
 

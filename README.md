@@ -178,25 +178,28 @@ Important indexing settings near the top of `ka_nfet.inc` are:
   first encoder read. The implementation derives Timer1 ticks from this value.
 - `INDEX_SLEW_RPM` — maximum mechanical target speed. Acceleration and final
   tapering remain internal implementation details.
-- `INDEX_P_GAIN` — tracking-error stiffness in pulse-density counts per encoder
-  count. The default is 8, reduced from the previous fixed value of 12.
-- `INDEX_D_GAIN` — damping per measured encoder count/update. The default is 24,
-  increased from 16 to address the observed underdamped response.
+- `INDEX_P_GAIN` and `INDEX_D_GAIN` — gain numerators in sixteenths. For example,
+  `4` means 0.25 and `16` means 1.0. The current values are P=1.50 and D=0.50.
 - `INDEX_I_GAIN` and `INDEX_I_MAX` — final-only static-error correction and its
-  accumulator clamp. Integral action remains disabled while the target moves.
-- `INDEX_FF_GAIN` — feed-forward pulse density per target encoder-count/update.
-  A value of 64 reproduces the previous `target_rate / 4` feed-forward; lower
-  values soften commanded acceleration without changing the motion profile.
-- `INDEX_CAL_DUTY_MAX` — hardware safety ceiling for the automatically learned
-  low-side pulse width.
+  accumulator clamp. I gain uses the same sixteenths scale and is currently
+  0.50. Integral action remains disabled while the target moves.
+- `INDEX_FF_GAIN` — feed-forward logical command per target
+  encoder-count/update. A value of 64 produces `target_rate / 4`; the current
+  tuned value is 0.
+- `INDEX_STUCK_DELTA` — maximum absolute encoder change per 4.096 ms sample
+  considered virtually stopped. The default of 3 tolerates AS5600 noise while
+  still requiring 16 consecutive low-motion samples before breakaway assistance.
+- `INDEX_CAL_DUTY_MAX` — hard safety ceiling for the breakaway search. Normal
+  calibration and homing use the measured raw threshold plus an internal
+  eight-cycle operating margin, not this ceiling.
 - `INDEX_DEADTIME_US` — board-specific all-off time around vector changes.
 
 State values, I2C protocol constants, calibration acceptance limits, settle
 timing, fixed-point scales, and derived carrier timing remain private to
-`tgy.asm`. The default tracking law is
-`64 * target_rate + 8 * error - 24 * rotor_delta + 2 * (integral / 32)`, where
-`target_rate` is expressed in encoder counts/update. The integral is bounded,
-disabled while the target moves, and reset on an error-sign change.
+`tgy.asm`. With the current values, the tracking law is
+`1.50 * error - 0.50 * rotor_delta + 0.50 * (integral / 32)`, where the integral
+term is bounded by 8191, disabled while the target moves, and reset on an
+error-sign change.
 
 For an underdamped response, reduce `INDEX_P_GAIN` first or raise
 `INDEX_D_GAIN`; change one at a time. Reduce `INDEX_FF_GAIN` if overshoot begins
@@ -204,13 +207,26 @@ during commanded acceleration rather than during final position correction.
 `INDEX_I_GAIN` and `INDEX_I_MAX` affect only the final stopped-target phase and
 should not be used to correct oscillation during the slew.
 
-Breakaway duty, pole pairs, encoder direction, and encoder/electrical zero
-offset are measured per assembly and stored in EEPROM rather than compiled into
-the image. The duty ceiling, sweep acceptance tolerances, and final correction
-behavior still need validation and tuning on the actual motor and supply.
-Upgrading from the earlier SVM/PDM build preserves the stored mechanical home
-but intentionally invalidates its shorter electrical-calibration record, so
-the first eligible post-run stop performs the new breakaway calibration once.
+Static-torque threshold, bounded operating duty, pole pairs, encoder direction,
+and encoder/electrical zero offset are measured per assembly and stored in
+EEPROM rather than compiled into the image. The breakaway search alternates two
+fields 60 electrical degrees apart while ramping from minimum duty, preventing
+an aligned or anti-aligned starting position from hiding at zero torque. Once
+motion is detected, alignment and the two-turn geometry sweeps use only the
+measured threshold plus an eight-cycle margin. During homing, moving torque is
+continuous down to one pulse-density count. Breakaway compensation is enabled
+only after 16 consecutive samples at or below `INDEX_STUCK_DELTA` and is removed
+when measured motion exceeds that threshold, avoiding both encoder-noise resets
+and a discontinuous torque reversal around home. A zero fixed-point PID result
+does not clear this measured-motion history; when error remains outside the home
+tolerance, the controller applies breakaway torque in the error direction.
+The configured ceiling is never selected merely because position error is large.
+
+Calibration accepts breakaway only after four consecutive samples remain beyond
+the full configured encoder-noise band. This calibration format invalidates the
+previous electrical record while preserving the stored mechanical home. The
+first eligible post-run stop after flashing therefore performs electrical
+calibration once.
 
 ## Installing AVRA
 
@@ -319,10 +335,10 @@ Intermediate `.obj`, `.cof`, and EEPROM HEX files are removed.
 
 The current experimental build assembles without errors and reports:
 
-- application code through word address `0x0C87` (6416 bytes),
-- bootloader beginning at word address `0x0E00`, leaving 752 bytes of unused
+- application code through word address `0x0D19` (6708 bytes),
+- bootloader beginning at word address `0x0E00`, leaving 460 bytes of unused
   application flash before the boot section,
-- 114 bytes of SRAM allocated out of the ATmega8A's 1024 bytes.
+- 116 bytes of SRAM allocated out of the ATmega8A's 1024 bytes.
 
 There is ample raw program and data memory for the state machine and fixed-point
 encoder/electrical-angle math. The more important constraint is deterministic
@@ -339,9 +355,10 @@ supply and begin below the normal flight voltage if the gate supply permits it.
    not occur.
 3. Command a brief normal sensorless run, then return below zero throttle.
 4. Confirm all phases remain off for approximately 5 seconds. On this first
-   cycle, expect a short vector-zero hold, a one-step breakaway-duty search,
-   one slow six-step electrical revolution forward, one backward, and then
-   normal homing. For seven pole pairs, each calibration sweep is about 51.4
+   cycle, expect a low-duty hold, an alternating-vector breakaway-duty search,
+   an alignment hold, two slow electrical revolutions forward and two backward,
+   and then
+   normal homing. For seven pole pairs, each calibration sweep is about 102.9
    mechanical degrees at 4.09 RPM.
 5. After calibration completes, homing should begin at approximately 15 RPM
    and take the shortest path to the stored mechanical home. Motion should
