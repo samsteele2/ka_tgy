@@ -333,6 +333,10 @@
 	.equ	ALL_FETS	= (1<<A_FET)+(1<<B_FET)+(1<<C_FET)
 	.equ	TIMING_FAST	= 6	; if set, timing fits in 16 bits
 	.equ	SKIP_CPWM	= 7	; if set, skip complementary PWM (for short off period)
+	.if INDEX_ENABLE
+	.equ	INDEX_PACKET_PWM = 5	; flags2: use damped near-home PWM packets
+	.equ	INDEX_BRAKE_VECTOR = 0xfe	; index_pwm_vector marker: all low sides braking
+	.endif
 ;.def			= r19
 .def	i_temp1		= r20		; interrupt temporary
 .def	i_temp2		= r21		; interrupt temporary
@@ -416,7 +420,8 @@ index_voltage_l: .byte 1	; Requested q-axis voltage-vector angle, 0..4095
 index_voltage_h: .byte 1
 index_q_command: .byte 1	; Calibrated vector direction: -1, 0, or +1
 index_vector_sector: .byte 1	; Nearest six-step active vector, 0..5
-index_pwm_vector: .byte 1	; Currently energized vector, or 0xff when off
+index_pwm_vector: .byte 1	; Energized vector 0..5, 0xfe brake, or 0xff off
+index_pwm_pulses: .byte 1	; Pulses remaining in a near-home correction packet
 index_cal_state: .byte 1	; Automatic electrical-calibration phase
 index_cal_ticks_l: .byte 1	; Service ticks within the current phase
 index_cal_ticks_h: .byte 1
@@ -1542,6 +1547,93 @@ pwm_on_fast:
 		out	TCNT2, duty_l
 		reti
 
+.if INDEX_ENABLE
+	; Homing uses deterministic packets of normal-width low-side pulses.
+	; At the end of each packet, turn the bridge completely off, wait the normal
+	; break-before-make interval, and short all three motor phases through the low
+	; FETs. Hold that brake for a bounded interval, then coast until the next
+	; position update. This damps every correction without over-braking it.
+	; These index-only handlers leave the normal SimonK PWM ISR unchanged.
+index_pwm_packet_on:
+		cpse	tcnt2h, ZH
+		rjmp	pwm_again
+		sbrc	flags2, A_FET
+		PWM_A_on
+		sbrc	flags2, B_FET
+		PWM_B_on
+		sbrc	flags2, C_FET
+		PWM_C_on
+		ldi	ZL, low(index_pwm_packet_off)
+		mov	tcnt2h, duty_h
+		out	TCNT2, duty_l
+		reti
+
+index_pwm_packet_off:
+		cpse	tcnt2h, ZH
+		rjmp	pwm_again
+		wdr
+		ldi	ZL, low(index_pwm_packet_on)
+		mov	tcnt2h, off_duty_h
+		sbrc	flags2, A_FET
+		PWM_A_off
+		sbrc	flags2, B_FET
+		PWM_B_off
+		sbrc	flags2, C_FET
+		PWM_C_off
+		out	TCNT2, off_duty_l
+
+		in	i_sreg, SREG
+		lds	i_temp1, index_pwm_pulses
+		tst	i_temp1
+		breq	index_pwm_packet_done
+		dec	i_temp1
+		sts	index_pwm_pulses, i_temp1
+		brne	index_pwm_packet_more
+index_pwm_packet_done:
+		all_pFETs_off i_temp1
+		all_nFETs_off i_temp1
+		ldi	ZL, low(index_pwm_packet_brake)
+		ldi	i_temp1, high(INDEX_DEADTIME_CYCLES)
+		mov	tcnt2h, i_temp1
+		ldi	i_temp1, 0xff-low(INDEX_DEADTIME_CYCLES)
+		out	TCNT2, i_temp1
+		out	SREG, i_sreg
+		reti
+index_pwm_packet_brake:
+		cpse	tcnt2h, ZH
+		rjmp	pwm_again
+		in	i_sreg, SREG
+		nFET_brake i_temp1
+		ldi	ZL, low(index_pwm_packet_coast)
+		ldi	i_temp1, high(INDEX_BRAKE_HOLD_CYCLES)
+		mov	tcnt2h, i_temp1
+		ldi	i_temp1, 0xff-low(INDEX_BRAKE_HOLD_CYCLES)
+		out	TCNT2, i_temp1
+		lds	i_temp2, index_state
+		andi	i_temp2, 0xff-(1<<INDEX_PWM_RUNNING)
+		sts	index_state, i_temp2
+		ldi	i_temp2, INDEX_BRAKE_VECTOR
+		sts	index_pwm_vector, i_temp2
+		out	SREG, i_sreg
+		reti
+index_pwm_packet_coast:
+		cpse	tcnt2h, ZH
+		rjmp	pwm_again
+		in	i_sreg, SREG
+		all_nFETs_off i_temp1
+		out	TCCR2, ZH
+		ldi	i_temp1, (1<<TOV2)
+		out	TIFR, i_temp1
+		ldi	ZL, low(pwm_wdr)
+		ldi	i_temp2, 0xff
+		sts	index_pwm_vector, i_temp2
+		out	SREG, i_sreg
+		reti
+index_pwm_packet_more:
+		out	SREG, i_sreg
+		reti
+.endif
+
 pwm_wdr:					; Just reset watchdog
 		wdr
 		reti
@@ -1582,6 +1674,9 @@ pwm_off:
 
 .if high(pwm_off)
 .error "high(pwm_off) is non-zero; please move code closer to start or use 16-bit (ZH) jump registers"
+.endif
+.if INDEX_ENABLE && (high(index_pwm_packet_on) || high(index_pwm_packet_off) || high(index_pwm_packet_brake) || high(index_pwm_packet_coast))
+.error "Index packet PWM handlers must remain in the low Timer2 dispatch page"
 .endif
 ;-----bko-----------------------------------------------------------------
 ; timer1 output compare interrupt
@@ -3295,6 +3390,7 @@ i2c_init:
 index_disarm:	sts	index_state, ZH
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
+		cbr	flags2, (1<<INDEX_PACKET_PWM)
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
 		out	TWCR, ZH
@@ -3379,6 +3475,7 @@ index_run_enter:
 		sts	index_state, temp1
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
+		cbr	flags2, (1<<INDEX_PACKET_PWM)
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
 		out	TWCR, ZH
@@ -3540,6 +3637,51 @@ index_slew_store:
 		sts	index_target_l, temp3
 		sts	index_target_h, temp4
 
+	; Use bounded drive/brake/coast packets over the entire homing move. Packet
+	; energy falls through five distance bands as the rotor nears home. Counter
+	; is written before the register flag so the packet ISR can never observe an
+	; uninitialized count.
+		lds	temp1, index_home_l
+		lds	temp2, index_home_h
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		andi	temp2, 0x0f
+		sbrs	temp2, 3
+		rjmp	index_approach_absolute
+		ori	temp2, 0xf0
+		com	temp2
+		neg	temp1
+		sbci	temp2, 0xff
+index_approach_absolute:
+index_approach_packet:
+		ldi	temp3, INDEX_HOMING_PULSES_OUTER
+		cpi	temp1, low(INDEX_HOMING_BAND_OUTER_COUNTS)
+		ldi	temp4, high(INDEX_HOMING_BAND_OUTER_COUNTS)
+		cpc	temp2, temp4
+		brsh	index_approach_packet_store
+		ldi	temp3, INDEX_HOMING_PULSES_FAR
+		cpi	temp1, low(INDEX_HOMING_BAND_FAR_COUNTS)
+		ldi	temp4, high(INDEX_HOMING_BAND_FAR_COUNTS)
+		cpc	temp2, temp4
+		brsh	index_approach_packet_store
+		ldi	temp3, INDEX_HOMING_PULSES_MID
+		cpi	temp1, low(INDEX_HOMING_BAND_MID_COUNTS)
+		ldi	temp4, high(INDEX_HOMING_BAND_MID_COUNTS)
+		cpc	temp2, temp4
+		brsh	index_approach_packet_store
+		ldi	temp3, INDEX_HOMING_PULSES_INNER
+		cpi	temp1, INDEX_HOMING_BAND_NEAR_COUNTS + 1
+		brsh	index_approach_packet_store
+		ldi	temp3, INDEX_HOMING_PULSES_NEAR
+index_approach_packet_store:
+		sts	index_pwm_pulses, temp3
+		sbr	flags2, (1<<INDEX_PACKET_PWM)
+index_approach_mode_done:
+		lds	temp3, index_target_l
+		lds	temp4, index_target_h
+
 	; Signed shortest target-minus-measured position error.
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
@@ -3695,6 +3837,7 @@ index_sector_rounded:
 	; rearms the next high-to-low indexing event.
 index_home_complete:
 		rcall	switch_power_off
+		cbr	flags2, (1<<INDEX_PACKET_PWM)
 		lds	temp1, index_state
 		andi	temp1, (1<<INDEX_ARMED)
 		sts	index_state, temp1
@@ -3708,6 +3851,7 @@ index_home_complete:
 	; Vector zero is established first. Vector one is then used to learn the
 	; minimum low-side PWM duty that produces verified encoder movement.
 index_calibration_start:
+		cbr	flags2, (1<<INDEX_PACKET_PWM)
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)|(1<<INDEX_CALIBRATING)
@@ -4300,21 +4444,43 @@ index_as5600_error:
 		ret
 
 	; Homing uses the learned low-side pulse width. The vector angle already
-	; contains the torque direction, so a zero command means coast and any
-	; nonzero command energizes the nearest sensored six-step vector.
+	; contains the torque direction, so a nonzero command energizes the nearest
+	; sensored six-step vector. In the damped approach, zero torque retains an
+	; already-active phase brake; outside it, zero torque releases the bridge.
 index_six_step_update:
 		lds	temp1, index_q_command
 		tst	temp1
-		breq	index_six_step_stop
+		brne	index_six_step_update_nonzero
+		sbrs	flags2, INDEX_PACKET_PWM
+		rjmp	index_six_step_stop
+		lds	temp1, index_pwm_vector
+		cpi	temp1, INDEX_BRAKE_VECTOR
+		breq	index_six_step_return
+		rjmp	index_six_step_stop
+index_six_step_update_nonzero:
+		sbrs	flags2, INDEX_PACKET_PWM
+		rjmp	index_six_step_update_drive
+		; End the previous packet's brake or coast state before starting the next
+		; distance-scaled packet. index_position_step has already loaded the
+		; appropriate 8-, 12-, 16-, 24-, or 32-pulse count.
+		rcall	index_six_step_stop
+index_six_step_update_drive:
 		lds	temp1, index_vector_sector
 		lds	temp2, index_pwm_duty_l
 		lds	temp3, index_pwm_duty_h
 		rjmp	index_six_step_drive
 
+index_six_step_return:
+		ret
+
 index_six_step_stop:
 		lds	temp1, index_state
-		sbrs	temp1, INDEX_PWM_RUNNING
-		ret
+		sbrc	temp1, INDEX_PWM_RUNNING
+		rjmp	index_six_step_stop_power
+		lds	temp1, index_pwm_vector
+		cpi	temp1, INDEX_BRAKE_VECTOR
+		brne	index_six_step_return
+index_six_step_stop_power:
 		rcall	switch_power_off
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
@@ -4415,7 +4581,13 @@ index_six_step_rise_delay:
 		ori	temp1, (1<<INDEX_PWM_RUNNING)
 		sts	index_state, temp1
 		rcall	index_six_step_timing
+		sbrc	flags2, INDEX_PACKET_PWM
+		rjmp	index_six_step_start_packet
 		ldi	ZL, low(pwm_on)
+		rjmp	index_six_step_start_timer
+index_six_step_start_packet:
+		ldi	ZL, low(index_pwm_packet_on)
+index_six_step_start_timer:
 		mov	tcnt2h, ZH
 		ldi	temp1, 0xff
 		out	TCNT2, temp1
@@ -4433,9 +4605,15 @@ index_six_step_timing:
 		ldi2	temp1, temp2, MAX_POWER
 		sub	temp1, YL
 		sbc	temp2, YH
+		sbrc	flags2, INDEX_PACKET_PWM
+		rjmp	index_six_step_timing_packet
 		ldi	temp4, low(pwm_on)
 		cpse	temp2, ZH
 		ldi	temp4, low(pwm_on_high)
+		rjmp	index_six_step_timing_store
+index_six_step_timing_packet:
+		ldi	temp4, low(index_pwm_packet_on)
+index_six_step_timing_store:
 		com	YL
 		com	temp1
 		movw	duty_l, YL

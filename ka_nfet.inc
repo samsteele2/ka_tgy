@@ -53,10 +53,42 @@
 .equ	INDEX_CONTROL_PERIOD_US = 4096	; One Timer1 overflow, approximately 244.14 Hz
 .equ	INDEX_SLEW_STEP_Q8		= 1074	; 4.195 counts/update = 15.004 RPM
 .equ	INDEX_POSITION_TOLERANCE = 2	; AS5600 counts
+.equ	INDEX_HOMING_BAND_NEAR_COUNTS = 64	; 5.625 mechanical degrees
+.equ	INDEX_HOMING_BAND_MID_COUNTS = 256	; 22.5 mechanical degrees
+.equ	INDEX_HOMING_BAND_FAR_COUNTS = 512	; 45 mechanical degrees
+.equ	INDEX_HOMING_BAND_OUTER_COUNTS = 1024	; 90 mechanical degrees
+.equ	INDEX_HOMING_PULSES_NEAR = 8	; 0..5.625 degrees
+.equ	INDEX_HOMING_PULSES_INNER = 12	; 5.625..22.5 degrees
+.equ	INDEX_HOMING_PULSES_MID = 16	; 22.5..45 degrees
+.equ	INDEX_HOMING_PULSES_FAR = 24	; 45..90 degrees
+.equ	INDEX_HOMING_PULSES_OUTER = 32	; 90..180 degrees
+.if INDEX_HOMING_PULSES_NEAR < 1
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
+.if INDEX_HOMING_PULSES_NEAR >= INDEX_HOMING_PULSES_INNER
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
+.if INDEX_HOMING_PULSES_INNER >= INDEX_HOMING_PULSES_MID
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
+.if INDEX_HOMING_PULSES_MID >= INDEX_HOMING_PULSES_FAR
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
+.if INDEX_HOMING_PULSES_FAR >= INDEX_HOMING_PULSES_OUTER
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
+.if INDEX_HOMING_PULSES_OUTER > 255
+.error "Index homing PWM packet sizes must be ordered in the range 1..255"
+.endif
 .equ	INDEX_PWM_CARRIER_HZ	= 18691	; F_CPU / 856 for this 16 MHz SimonK build
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay before changing six-step vectors
 .equ	INDEX_DEADTIME_CYCLES	= (F_CPU / 1000000) * INDEX_DEADTIME_US
 .equ	INDEX_DEADTIME_LOOPS	= (INDEX_DEADTIME_CYCLES + 1) / 3	; dec/brne loop is 3n-1 cycles
+.equ	INDEX_BRAKE_HOLD_US		= 2048	; Brake for half a control period, then coast
+.equ	INDEX_BRAKE_HOLD_CYCLES = (F_CPU / 1000000) * INDEX_BRAKE_HOLD_US
+.if INDEX_BRAKE_HOLD_US >= INDEX_CONTROL_PERIOD_US
+.error "INDEX_BRAKE_HOLD_US must be shorter than one index control period"
+.endif
 .equ	INDEX_ARMED				= 0
 .equ	INDEX_WAITING			= 1
 .equ	INDEX_ACTIVE			= 2

@@ -33,9 +33,14 @@ The final control sequence is:
    produces four low-pitch pulses and leaves every FET off.
    A 244.14 Hz control service advances an internal target toward home at
    approximately 15 RPM, computes wrapped position error, and selects the
-   nearest sensored six-step torque vector. When both the slew target and rotor
-   enter the two-count home window, homing completes: all six FETs turn off and
-   AS5600 position polling stops for the remainder of that stopped cycle.
+   nearest sensored six-step torque vector. Every homing correction uses a
+   bounded packet of 32, 24, 16, 12, or 8 normal-width PWM pulses according to
+   distance from home. Each packet is followed by 5 us all-off deadtime,
+   2.048 ms of three-low-side dynamic braking, and then coasting until the next
+   encoder update. When both the
+   slew target and rotor enter the two-count home window, homing completes: all
+   six FETs turn off and AS5600 position polling stops for the remainder of that
+   stopped cycle.
    If that first AS5600 read fails, the ESC gives two low-pitch warning pulses
    once and cancels homing for that stopped cycle. If the encoder responds but
    no home has been calibrated, it gives three low-pitch pulses instead.
@@ -71,9 +76,9 @@ This is an experimental development build, not flight firmware.
 | Fail safely on I2C NACK/timeout and immediately yield to raised throttle | Implemented in the state-machine scaffold |
 | 15 RPM target slew and wrapped position controller | Implemented and assembling; not hardware-validated |
 | Electrical-angle and signed torque-vector math | Implemented; requires motor calibration |
-| Generate sensored six-step torque with ultrasonic low-side PWM | Implemented; replaces the audible 4 kHz SVM/PDM experiment and is not yet hardware-validated |
+| Generate sensored six-step torque with ultrasonic low-side PWM and all-range drive/brake/coast packets | Implemented; replaces both continuous homing drive and the audible 4 kHz SVM/PDM experiment; hardware tuning is in progress |
 | Automatically determine breakaway duty, encoder direction, pole pairs, and electrical offset | Implemented as a bounded six-vector forward/reverse sweep with EEPROM persistence; not yet hardware-validated |
-| Tune and validate with the actual motor, encoder, supply, and gate stage | Not started |
+| Tune and validate with the actual motor, encoder, supply, and gate stage | In progress; continuous drive and coast-only packets showed excessive final-position oscillation |
 
 `INDEX_ENABLE` and `INDEX_DRIVE_ENABLE` are currently `1`. A calibrated EEPROM
 home is required before the post-run state machine will energize the motor.
@@ -82,8 +87,16 @@ For each sector, one high-side source FET stays on continuously and only the
 selected low-side sink is PWM-switched. Timer2 runs at SimonK's normal carrier
 of approximately 18.69 kHz, above the fixed 4 kHz tone produced by the earlier
 SVM/PDM experiment. Complementary PWM is explicitly disabled in index mode.
-Every carrier frame is available, giving the breakaway calibration consistent
-torque without the static-like sound produced by pseudorandom frame skipping.
+Calibration uses every carrier frame, giving breakaway
+calibration consistent torque without the static-like sound produced by
+pseudorandom frame skipping. Homing always uses a distance-scaled correction:
+32 pulses at 90–180 degrees, 24 at 45–90 degrees, 16 at 22.5–45 degrees, 12 at
+5.625–22.5 degrees, and 8 inside the final 5.625 degrees. After 5 us with all
+six FETs off, all three low-side FETs turn on together for 2.048 ms. The bridge
+then coasts for the remainder of the 4.096 ms control interval. Compared with
+braking for the entire remainder, this cuts brake time by approximately 36–44%
+in the previously damped 0–45 degree region.
+The individual pulse width remains the learned breakaway value.
 Every sector change first turns all six FETs off for 5 us, turns on the new
 high-side source, waits another 5 us for the measured slow gate transition,
 and only then starts low-side PWM.
@@ -176,6 +189,11 @@ Important indexing settings near the top of `ka_nfet.inc` are:
   used before direction, pole pairs, or offset can be committed.
 - `INDEX_SLEW_STEP_Q8` — 1074/256 encoder counts every 4.096 ms, corresponding
   to approximately 15.004 RPM.
+- `INDEX_HOMING_BAND_*_COUNTS` and `INDEX_HOMING_PULSES_*` — five distance
+  bands spanning the complete shortest-path homing move, with packet sizes of
+  32, 24, 16, 12, and 8 carrier pulses from farthest to nearest.
+- `INDEX_BRAKE_HOLD_US` — 2048 us of three-low-side dynamic braking after each
+  torque packet; the bridge coasts after this interval expires.
 - `INDEX_PWM_CARRIER_HZ` — documentation constant for the approximately
   18.69 kHz carrier produced by the normal 16 MHz SimonK Timer2 timing.
 - `INDEX_DEADTIME_US` — 5 us all-off break-before-make delay; the same delay
@@ -297,10 +315,10 @@ Intermediate `.obj`, `.cof`, and EEPROM HEX files are removed.
 
 The current experimental build assembles without errors and reports:
 
-- application code through word address `0x0A81` (5380 bytes),
-- bootloader beginning at word address `0x0E00`, leaving 1788 bytes of unused
+- application code through word address `0x0B1B` (5688 bytes),
+- bootloader beginning at word address `0x0E00`, leaving 1480 bytes of unused
   application flash before the boot section,
-- 101 bytes of SRAM allocated out of the ATmega8A's 1024 bytes.
+- 102 bytes of SRAM allocated out of the ATmega8A's 1024 bytes.
 
 There is ample raw program and data memory for the state machine and fixed-point
 encoder/electrical-angle math. The more important constraint is deterministic
@@ -322,11 +340,14 @@ supply and begin below the normal flight voltage if the gate supply permits it.
    normal homing. For seven pole pairs, each calibration sweep is about 51.4
    mechanical degrees at 4.09 RPM.
 5. After calibration completes, homing should begin at approximately 15 RPM
-   and take the shortest path to the stored mechanical home. At home, verify
-   that phase current falls to zero and remains off; the firmware no longer
-   polls or corrects position during that stopped cycle. On subsequent run/stop
-   cycles, calibration is skipped and homing starts directly after the
-   five-second delay.
+   and take the shortest path to the stored mechanical home. Motion should
+   use controlled drive/brake/coast corrections throughout the entire move,
+   with visibly smaller corrections as it approaches home. Braking can produce
+   circulating motor current between corrections but should not apply
+   stationary torque. At home, verify that phase current falls to zero and
+   remains off; the firmware no longer polls or corrects position during that stopped
+   cycle. On subsequent run/stop cycles, calibration is skipped and homing
+   starts directly after the five-second delay.
 6. Raise throttle during calibration or homing and confirm that the index drive
    stops on the next accepted PWM command and normal SimonK control resumes.
 7. Repeat once with the AS5600 disconnected: after the delay, expect two low
