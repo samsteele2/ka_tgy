@@ -282,40 +282,31 @@
 .equ	INDEX_AS5600_ANGLE_REG = 0x0e
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
 .equ	INDEX_HOME_MARKER = 0xa5
-.equ	INDEX_ELECTRICAL_MARKER = 0x5e	; Sparse-pulse calibration record
+.equ	INDEX_ELECTRICAL_MARKER = 0x5f	; Settled-endpoint calibration record
 
 ; Calibration emits one pulse per four 20 kHz frames. Doubling the individual
 ; pulse width preserves Timer2 timing margin while halving average bridge duty
 ; and reducing low-side switching events from 20 kHz to 5 kHz. Homing remains
 ; on the 20 kHz pulse-density carrier with the original pulse-width range.
 .equ	INDEX_CAL_PULSE_DENSITY = 64
-.equ	INDEX_CAL_DUTY_SCALE = 2
 .equ	INDEX_HOME_DUTY_MIN = MIN_DUTY
-.equ	INDEX_HOME_DUTY_MARGIN = 8
-.equ	INDEX_HOME_DUTY_MAX = INDEX_CAL_DUTY_MAX / INDEX_CAL_DUTY_SCALE
-.equ	INDEX_CAL_DUTY_MIN = MIN_DUTY * INDEX_CAL_DUTY_SCALE
-.equ	INDEX_CAL_DUTY_STEP = 4 * INDEX_CAL_DUTY_SCALE
-.equ	INDEX_CAL_DUTY_MARGIN = 8 * INDEX_CAL_DUTY_SCALE
+.equ	INDEX_HOME_DUTY_MAX = 64
+.equ	INDEX_CAL_DUTY_MIN = MIN_DUTY * 2
 .equ	INDEX_CAL_MOVE_COUNTS = INDEX_CAL_NOISE_DELTA * 2 + 1
-.equ	INDEX_CAL_MOVE_SAMPLES = 4	; Sustained displacement, not one noise excursion
-.equ	INDEX_CAL_RAMP_STEP_TICKS = 12
 .equ	INDEX_CAL_SETTLE_DELTA = INDEX_CAL_NOISE_DELTA
 .equ	INDEX_CAL_SETTLE_WINDOW = INDEX_CAL_NOISE_DELTA * 2
 .equ	INDEX_CAL_SETTLE_SAMPLES = 64	; 262.144 ms continuously stable
 .equ	INDEX_CAL_SETTLE_TIMEOUT_TICKS = 733	; 3.002 s maximum per hold
-.equ	INDEX_CAL_SWEEP_STEP = 8
 .equ	INDEX_CAL_SWEEP_REVOLUTIONS = 2	; Average endpoint nonlinearity over two pole pitches
 .equ	INDEX_CAL_SWEEP_COUNTS = 4096 * INDEX_CAL_SWEEP_REVOLUTIONS
-.equ	INDEX_CAL_SWEEP_TICKS = INDEX_CAL_SWEEP_COUNTS / INDEX_CAL_SWEEP_STEP
+.equ	INDEX_CAL_ACQUIRE_STEPS = 6	; One discarded electrical revolution
+.equ	INDEX_CAL_MEASURE_STEPS = 6 * INDEX_CAL_SWEEP_REVOLUTIONS
+.equ	INDEX_CAL_STEP_MAX = 1024	; Reject implausible settled pole jumps
 .equ	INDEX_CAL_MAX_POLE_PAIRS = 20
 .equ	INDEX_CAL_MIN_TRAVEL = 360
 .equ	INDEX_CAL_TRAVEL_MATCH = 32
 .equ	INDEX_CAL_RETURN_TOLERANCE = 32
 .equ	INDEX_CAL_POLE_FIT = 128
-.if (INDEX_CAL_SWEEP_COUNTS % INDEX_CAL_SWEEP_STEP)
-.error "INDEX_CAL_SWEEP_STEP must divide the calibration sweep"
-.endif
-
 .equ	INDEX_PWM_CARRIER_HZ = 20000
 .equ	INDEX_PWM_PERIOD_CYCLES = F_CPU / INDEX_PWM_CARRIER_HZ
 .if F_CPU % INDEX_PWM_CARRIER_HZ
@@ -327,8 +318,8 @@
 .if INDEX_CAL_DUTY_MAX < INDEX_CAL_DUTY_MIN
 .error "Index calibration duty ceiling must not be below its starting duty"
 .endif
-.if (INDEX_CAL_DUTY_MAX % INDEX_CAL_DUTY_SCALE) || (INDEX_HOME_DUTY_MAX < INDEX_HOME_DUTY_MIN)
-.error "Index calibration ceiling must yield a valid homing pulse width"
+.if INDEX_HOME_DUTY_MAX < INDEX_HOME_DUTY_MIN
+.error "Index homing pulse-width range is invalid"
 .endif
 .equ	INDEX_DEADTIME_CYCLES = (F_CPU / 1000000) * INDEX_DEADTIME_US
 .equ	INDEX_DEADTIME_LOOPS = (INDEX_DEADTIME_CYCLES + 1) / 3
@@ -341,12 +332,9 @@
 .equ	INDEX_PWM_RUNNING = 5
 .equ	INDEX_CALIBRATING = 6
 .equ	INDEX_CAL_BASE_HOLD = 1
-.equ	INDEX_CAL_BREAKAWAY = 2
-.equ	INDEX_CAL_ALIGN_HOLD = 3
-.equ	INDEX_CAL_SWEEP_FORWARD = 4
-.equ	INDEX_CAL_FORWARD_HOLD = 5
-.equ	INDEX_CAL_SWEEP_REVERSE = 6
-.equ	INDEX_CAL_FINAL_HOLD = 7
+.equ	INDEX_CAL_ACQUIRE = 2
+.equ	INDEX_CAL_SWEEP_FORWARD = 3
+.equ	INDEX_CAL_SWEEP_REVERSE = 4
 .endif
 
 .equ	PWR_COOL_START	= (POWER_RANGE/24) ; Power limit while starting to reduce heating
@@ -531,20 +519,18 @@ index_cal_ticks_h: .byte 1
 index_cal_stable: .byte 1	; Consecutive low-motion calibration samples
 index_cal_settle_l: .byte 1	; Angle at start of the current stable window
 index_cal_settle_h: .byte 1
-index_cal_field_l: .byte 1	; Commanded stationary/swept electrical field
-index_cal_field_h: .byte 1
+index_cal_vector: .byte 1	; Commanded settled six-step vector, 0..5
+index_cal_steps: .byte 1	; Settled vector steps in the current phase
 index_cal_previous_l: .byte 1 ; Previous AS5600 sample for unwrap
 index_cal_previous_h: .byte 1
+index_cal_endpoint_l: .byte 1 ; Previous settled endpoint for measured travel
+index_cal_endpoint_h: .byte 1
 index_cal_start_l: .byte 1	; Settled mechanical position at field angle zero
 index_cal_start_h: .byte 1
 index_cal_travel_l: .byte 1	; Signed unwrapped travel for the current sweep
 index_cal_travel_h: .byte 1
 index_cal_forward_l: .byte 1	; Signed forward-sweep travel
 index_cal_forward_h: .byte 1
-index_cal_duty_l: .byte 1	; Low-side Timer2 on-time used during calibration
-index_cal_duty_h: .byte 1
-index_cal_baseline_l: .byte 1 ; Encoder position before breakaway test
-index_cal_baseline_h: .byte 1
 .endif
 motor_count:	.byte	1	; Motor number for serial control
 brake_sub:	.byte	1	; Brake speed subtrahend (power of two)
@@ -578,9 +564,9 @@ index_electrical_offset_l: .byte 1 ; Automatically calibrated electrical offset
 index_electrical_offset_h: .byte 1
 index_pole_pairs: .byte 1	; Automatically measured motor pole-pair count
 index_encoder_reverse: .byte 1	; 0: counts follow field sweep, 1: counts are reversed
-index_pwm_duty_l: .byte 1	; Learned breakaway duty plus bounded operating margin
+index_pwm_duty_l: .byte 1	; Fixed Timer2 pulse width used by homing density control
 index_pwm_duty_h: .byte 1
-index_breakaway_density: .byte 1 ; Raw breakaway threshold expressed at index_pwm_duty
+index_breakaway_density: .byte 1 ; Legacy nonzero field retained in EEPROM layout
 index_electrical_valid: .byte 1	; Written last as the calibration commit marker
 .endif
 eeprom_end:	.byte	1
@@ -1656,8 +1642,8 @@ pwm_on_fast:
 
 .if INDEX_ENABLE
 	; Index-only first-order pulse-density modulator. The selected high-side
-	; source remains static; each 20 kHz frame either emits one learned-width
-	; low-side pulse or remains off. The accumulator spreads sub-breakaway torque
+	; source remains static; each 20 kHz frame either emits one fixed-width
+	; low-side pulse or remains off. The accumulator spreads fractional torque
 	; deterministically without the old 244 Hz packet/brake envelope.
 index_pwm_density_on:
 		cpse	tcnt2h, ZH
@@ -4027,62 +4013,55 @@ index_home_complete:
 		out	TWCR, ZH
 		ret
 
-	; Begin a one-time automatic calibration when a valid mechanical home exists
-	; but the motor/encoder electrical relationship has not been committed.
-	; Begin at the minimum allowed stationary duty. The breakaway search alternates
-	; two fields 60 electrical degrees apart as it ramps, so an initially aligned
-	; or anti-aligned rotor cannot hide at a zero-torque point. Once motion proves
-	; the raw threshold, all later calibration drive is capped at threshold+margin.
+	; Use one fixed, current-limited waveform. A discarded six-vector revolution
+	; first acquires synchronism; geometry is then measured only at settled poles.
 index_calibration_start:
 		sbr	flags2, (1<<INDEX_DENSITY_PWM)
 		ldi	temp1, INDEX_CAL_PULSE_DENSITY
 		sts	index_pwm_density, temp1
 		sts	index_pwm_accumulator, ZH
+		sts	index_breakaway_density, temp1	; Legacy EEPROM field; PI does not use it
+		ldi2	temp1, temp2, INDEX_HOME_DUTY_MIN
+		sts	index_pwm_duty_l, temp1
+		sts	index_pwm_duty_h, temp2
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)|(1<<INDEX_CALIBRATING)
 		sts	index_state, temp1
 		ldi	temp1, INDEX_CAL_BASE_HOLD
 		sts	index_cal_state, temp1
-		ldi2	temp1, temp2, INDEX_CAL_DUTY_MIN
-		sts	index_cal_duty_l, temp1
-		sts	index_cal_duty_h, temp2
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		sts	index_cal_field_l, ZH
-		sts	index_cal_field_h, ZH
+		sts	index_cal_vector, ZH
+		sts	index_cal_steps, ZH
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
-		lds	temp1, index_angle_l
-		lds	temp2, index_angle_h
-		sts	index_cal_previous_l, temp1
-		sts	index_cal_previous_h, temp2
-		sts	index_cal_baseline_l, temp1
-		sts	index_cal_baseline_h, temp2
-		sts	index_cal_settle_l, temp1
-		sts	index_cal_settle_h, temp2
+		rcall	index_calibration_prepare_hold
 		rcall	index_calibration_publish
 		ret
 
-	; Publish the nearest six-step vector for the direct calibration field.
-	; The rotor is expected to settle at each discrete vector.
+	; Apply the requested discrete vector at the fixed sparse-pulse ceiling.
 index_calibration_publish:
-		lds	temp1, index_cal_field_l
-		lds	temp2, index_cal_field_h
-		sts	index_voltage_l, temp1
-		sts	index_voltage_h, temp2
-		rcall	index_angle_to_vector
 		.if INDEX_DRIVE_ENABLE
-		lds	temp1, index_vector_sector
-		lds	temp2, index_cal_duty_l
-		lds	temp3, index_cal_duty_h
+		lds	temp1, index_cal_vector
+		ldi2	temp2, temp3, INDEX_CAL_DUTY_MAX
 		rcall	index_six_step_drive
 		.endif
 		ret
 
-	; Return the shortest signed delta from the latest AS5600 sample in
-	; temp4:temp3 and make this sample the next reference point.
+	; Reset one vector's settling consensus from the latest encoder sample.
+index_calibration_prepare_hold:
+		sts	index_cal_ticks_l, ZH
+		sts	index_cal_ticks_h, ZH
+		sts	index_cal_stable, ZH
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sts	index_cal_previous_l, temp1
+		sts	index_cal_previous_h, temp2
+		sts	index_cal_settle_l, temp1
+		sts	index_cal_settle_h, temp2
+		ret
+
+	; Return the shortest signed sample delta in temp4:temp3 and update the
+	; reference used only by the settling detector.
 index_calibration_delta:
 		lds	temp3, index_angle_l
 		lds	temp4, index_angle_h
@@ -4097,45 +4076,26 @@ index_calibration_delta:
 		ori	temp4, 0xf0
 		ret
 
-	; Convert the sparse calibration threshold to equivalent homing density:
-	;     B = ceil(raw_calibration_pulse * calibration_density / home_pulse).
-	; This value remains in the EEPROM record for compatibility and diagnostics;
-	; the simplified position controller does not inject breakaway compensation.
-index_calibration_store_breakaway:
-		lds	YL, index_cal_duty_l
-		lds	YH, index_cal_duty_h
-		lds	temp1, index_pwm_duty_l
-		lds	temp2, index_pwm_duty_h
-		clr	XL			; Division remainder
-		clr	XH
-		clr	temp4			; Quotient B
-		ldi	temp3, INDEX_CAL_PULSE_DENSITY
-index_calibration_breakaway_divide:
-		add	XL, YL
-		adc	XH, YH
-index_calibration_breakaway_subtract:
-		cp	XL, temp1
-		cpc	XH, temp2
-		brlo	index_calibration_breakaway_divide_next
-		sub	XL, temp1
-		sbc	XH, temp2
-		inc	temp4
-		rjmp	index_calibration_breakaway_subtract
-index_calibration_breakaway_divide_next:
-		dec	temp3
-		brne	index_calibration_breakaway_divide
-		mov	temp1, XL
-		or	temp1, XH
-		breq	index_calibration_breakaway_divide_exact
-		inc	temp4			; Round any remainder upward
-index_calibration_breakaway_divide_exact:
-		sts	index_breakaway_density, temp4
+	; Return the shortest signed delta between settled endpoints in temp4:temp3
+	; and make the current endpoint the reference for the next vector.
+index_calibration_endpoint_delta:
+		lds	temp3, index_angle_l
+		lds	temp4, index_angle_h
+		lds	temp1, index_cal_endpoint_l
+		lds	temp2, index_cal_endpoint_h
+		sts	index_cal_endpoint_l, temp3
+		sts	index_cal_endpoint_h, temp4
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrc	temp4, 3
+		ori	temp4, 0xf0
 		ret
 
-	; Add that delta to the current unwrapped sweep travel. temp4:temp3 remains
-	; available to the settling detector after the total is stored.
-index_calibration_accumulate:
-		rcall	index_calibration_delta
+	; Transient samples never enter the geometry fit; only settled endpoint travel
+	; is accumulated.
+index_calibration_accumulate_endpoint:
+		rcall	index_calibration_endpoint_delta
 		lds	temp1, index_cal_travel_l
 		lds	temp2, index_cal_travel_h
 		add	temp1, temp3
@@ -4209,44 +4169,110 @@ index_calibration_settle_done:
 		sec
 		ret
 
-	; Non-blocking 244 Hz calibration service. Positive and negative two-turn
-	; electrical sweeps provide encoder direction, pole-pair count, and agreement
-	; checks before any result is allowed into EEPROM. Two turns reduce the pole
-	; estimate's sensitivity to AS5600/magnet endpoint nonlinearity.
+	; Advance the direct six-step field by one electrical pole.
+index_calibration_vector_forward:
+		lds	temp1, index_cal_vector
+		inc	temp1
+		cpi	temp1, 6
+		brlo	index_calibration_vector_store
+		clr	temp1
+index_calibration_vector_store:
+		sts	index_cal_vector, temp1
+		ret
+
+index_calibration_vector_reverse:
+		lds	temp1, index_cal_vector
+		tst	temp1
+		brne	index_calibration_vector_reverse_decrement
+		ldi	temp1, 6
+index_calibration_vector_reverse_decrement:
+		dec	temp1
+		sts	index_cal_vector, temp1
+		ret
+
+	; Validate a settled forward step. The first step establishes raw encoder
+	; direction; later steps must agree and remain inside broad geometry bounds.
+index_calibration_forward_step_valid:
+		clr	YL
+		sbrs	temp4, 7
+		rjmp	index_calibration_forward_step_absolute
+		inc	YL
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_calibration_forward_step_absolute:
+		tst	temp4
+		brne	index_calibration_forward_step_min_ok
+		cpi	temp3, INDEX_CAL_MOVE_COUNTS
+		brlo	index_calibration_step_invalid
+index_calibration_forward_step_min_ok:
+		cpi	temp3, low(INDEX_CAL_STEP_MAX + 1)
+		ldi	temp1, high(INDEX_CAL_STEP_MAX + 1)
+		cpc	temp4, temp1
+		brsh	index_calibration_step_invalid
+		lds	temp1, index_cal_steps
+		tst	temp1
+		brne	index_calibration_forward_direction_known
+		sts	index_encoder_reverse, YL
+		clc
+		ret
+index_calibration_forward_direction_known:
+		lds	temp1, index_encoder_reverse
+		cp	temp1, YL
+		brne	index_calibration_step_invalid
+		clc
+		ret
+
+	; Reverse endpoints require the same movement bounds and the opposite sign.
+index_calibration_reverse_step_valid:
+		clr	YL
+		sbrs	temp4, 7
+		rjmp	index_calibration_reverse_step_absolute
+		inc	YL
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_calibration_reverse_step_absolute:
+		tst	temp4
+		brne	index_calibration_reverse_step_min_ok
+		cpi	temp3, INDEX_CAL_MOVE_COUNTS
+		brlo	index_calibration_step_invalid
+index_calibration_reverse_step_min_ok:
+		cpi	temp3, low(INDEX_CAL_STEP_MAX + 1)
+		ldi	temp1, high(INDEX_CAL_STEP_MAX + 1)
+		cpc	temp4, temp1
+		brsh	index_calibration_step_invalid
+		lds	temp1, index_encoder_reverse
+		cp	temp1, YL
+		breq	index_calibration_step_invalid
+		clc
+		ret
+index_calibration_step_invalid:
+		sec
+		ret
+
+	; Every vector must pass the 64-sample settling consensus before advancing.
 index_calibration_step:
 		lds	temp1, index_cal_state
 		cpi	temp1, INDEX_CAL_BASE_HOLD
 		brne	index_cal_not_base
 		rjmp	index_calibration_base_hold
 index_cal_not_base:
-		cpi	temp1, INDEX_CAL_BREAKAWAY
-		brne	index_cal_not_breakaway
-		rjmp	index_calibration_breakaway
-index_cal_not_breakaway:
-		cpi	temp1, INDEX_CAL_ALIGN_HOLD
-		brne	index_cal_not_align
-		rjmp	index_calibration_align_hold
-index_cal_not_align:
+		cpi	temp1, INDEX_CAL_ACQUIRE
+		brne	index_cal_not_acquire
+		rjmp	index_calibration_acquire
+index_cal_not_acquire:
 		cpi	temp1, INDEX_CAL_SWEEP_FORWARD
 		brne	index_cal_not_forward
 		rjmp	index_calibration_sweep_forward
 index_cal_not_forward:
-		cpi	temp1, INDEX_CAL_FORWARD_HOLD
-		brne	index_cal_not_forward_hold
-		rjmp	index_calibration_forward_hold
-index_cal_not_forward_hold:
 		cpi	temp1, INDEX_CAL_SWEEP_REVERSE
-		brne	index_cal_not_reverse
+		brne	index_calibration_bad_state
 		rjmp	index_calibration_sweep_reverse
-index_cal_not_reverse:
-		cpi	temp1, INDEX_CAL_FINAL_HOLD
-		breq	index_cal_final_state
+index_calibration_bad_state:
 		rjmp	index_calibration_failed
-index_cal_final_state:
-		rjmp	index_calibration_final_hold
 
-	; Wait for initial mechanical motion to cease at minimum duty, then begin the
-	; alternating-vector breakaway search from the current encoder position.
+	; Establish a quiet vector-zero start, then run one discarded acquisition turn.
 index_calibration_base_hold:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
@@ -4256,283 +4282,104 @@ index_calibration_base_no_timeout:
 		brcs	index_calibration_base_done
 		ret
 index_calibration_base_done:
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		lds	temp1, index_angle_l
-		lds	temp2, index_angle_h
-		sts	index_cal_baseline_l, temp1
-		sts	index_cal_baseline_h, temp2
-		ldi2	temp1, temp2, 683
-		sts	index_cal_field_l, temp1
-		sts	index_cal_field_h, temp2
-		ldi	temp1, INDEX_CAL_BREAKAWAY
+		sts	index_cal_steps, ZH
+		rcall	index_calibration_vector_forward
+		ldi	temp1, INDEX_CAL_ACQUIRE
 		sts	index_cal_state, temp1
+		rcall	index_calibration_prepare_hold
 		rjmp	index_calibration_publish
 
-index_calibration_breakaway:
-		lds	temp3, index_angle_l
-		lds	temp4, index_angle_h
-		lds	temp1, index_cal_baseline_l
-		lds	temp2, index_cal_baseline_h
-		sub	temp3, temp1
-		sbc	temp4, temp2
-		andi	temp4, 0x0f
-		sbrs	temp4, 3
-		rjmp	index_calibration_breakaway_abs
-		ori	temp4, 0xf0
-		com	temp4
-		neg	temp3
-		sbci	temp4, 0xff
-index_calibration_breakaway_abs:
-		tst	temp4
-		brne	index_calibration_breakaway_candidate
-		cpi	temp3, INDEX_CAL_MOVE_COUNTS
-		brsh	index_calibration_breakaway_candidate
-		sts	index_cal_stable, ZH
-
-		lds	temp1, index_cal_ticks_l
-		inc	temp1
-		cpi	temp1, INDEX_CAL_RAMP_STEP_TICKS
-		brsh	index_calibration_breakaway_ramp
-		sts	index_cal_ticks_l, temp1
-		ret
-index_calibration_breakaway_ramp:
-		sts	index_cal_ticks_l, ZH
-		lds	temp1, index_cal_duty_l
-		lds	temp2, index_cal_duty_h
-		cpi	temp1, low(INDEX_CAL_DUTY_MAX)
-		ldi	temp3, high(INDEX_CAL_DUTY_MAX)
-		cpc	temp2, temp3
-		brlo	index_calibration_breakaway_raise
-		rjmp	index_calibration_failed
-index_calibration_breakaway_raise:
-		subi	temp1, low(-INDEX_CAL_DUTY_STEP)
-		sbci	temp2, high(-INDEX_CAL_DUTY_STEP)
-		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
-		ldi	temp3, high(INDEX_CAL_DUTY_MAX + 1)
-		cpc	temp2, temp3
-		brlo	index_calibration_breakaway_raise_store
-		ldi2	temp1, temp2, INDEX_CAL_DUTY_MAX
-index_calibration_breakaway_raise_store:
-		sts	index_cal_duty_l, temp1
-		sts	index_cal_duty_h, temp2
-		; Alternate vector zero and vector one at every ramp step. No rotor
-		; position can be a zero-torque equilibrium for both fields.
-		lds	temp3, index_cal_field_l
-		lds	temp4, index_cal_field_h
-		mov	XL, temp3
-		or	XL, temp4
-		breq	index_calibration_breakaway_field_one
-		sts	index_cal_field_l, ZH
-		sts	index_cal_field_h, ZH
-		rjmp	index_calibration_publish
-index_calibration_breakaway_field_one:
-		ldi2	temp3, temp4, 683
-		sts	index_cal_field_l, temp3
-		sts	index_cal_field_h, temp4
-		rjmp	index_calibration_publish
-
-index_calibration_breakaway_candidate:
-		; A single displacement can be AS5600 noise. Hold the present field and
-		; require several consecutive samples outside the full +/- noise band.
-		lds	temp1, index_cal_stable
-		inc	temp1
-		sts	index_cal_stable, temp1
-		cpi	temp1, INDEX_CAL_MOVE_SAMPLES
-		brsh	index_calibration_breakaway_found
-		ret
-
-index_calibration_breakaway_found:
-		lds	temp1, index_cal_duty_l
-		lds	temp2, index_cal_duty_h
-		; Calibration continues at the sparse threshold plus its scaled margin.
-		; Preserve that pulse on the stack while deriving the separate 20 kHz
-		; homing pulse width from the average calibration excitation.
-		subi	temp1, low(-INDEX_CAL_DUTY_MARGIN)
-		sbci	temp2, high(-INDEX_CAL_DUTY_MARGIN)
-		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
-		ldi	temp3, high(INDEX_CAL_DUTY_MAX + 1)
-		cpc	temp2, temp3
-		brlo	index_calibration_breakaway_store
-		ldi2	temp1, temp2, INDEX_CAL_DUTY_MAX
-index_calibration_breakaway_store:
-		push	temp1
-		push	temp2
-
-		; Density 64 is one quarter of the carrier. Round the raw sparse pulse
-		; upward to its continuous-width equivalent, then add the original homing
-		; margin and clamp to the Timer2-safe homing range.
-		lds	temp1, index_cal_duty_l
-		lds	temp2, index_cal_duty_h
-		subi	temp1, low(-3)
-		sbci	temp2, high(-3)
-		lsr	temp2
-		ror	temp1
-		lsr	temp2
-		ror	temp1
-		subi	temp1, low(-INDEX_HOME_DUTY_MARGIN)
-		sbci	temp2, high(-INDEX_HOME_DUTY_MARGIN)
-		cpi	temp1, low(INDEX_HOME_DUTY_MIN)
-		ldi	temp3, high(INDEX_HOME_DUTY_MIN)
-		cpc	temp2, temp3
-		brcc	index_calibration_home_min_valid
-		ldi2	temp1, temp2, INDEX_HOME_DUTY_MIN
-index_calibration_home_min_valid:
-		cpi	temp1, low(INDEX_HOME_DUTY_MAX + 1)
-		ldi	temp3, high(INDEX_HOME_DUTY_MAX + 1)
-		cpc	temp2, temp3
-		brlo	index_calibration_home_store
-		ldi2	temp1, temp2, INDEX_HOME_DUTY_MAX
-index_calibration_home_store:
-		sts	index_pwm_duty_l, temp1
-		sts	index_pwm_duty_h, temp2
-		rcall	index_calibration_store_breakaway
-		pop	temp2
-		pop	temp1
-		sts	index_cal_duty_l, temp1
-		sts	index_cal_duty_h, temp2
-		sts	index_cal_field_l, ZH
-		sts	index_cal_field_h, ZH
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		lds	temp3, index_angle_l
-		lds	temp4, index_angle_h
-		sts	index_cal_previous_l, temp3
-		sts	index_cal_previous_h, temp4
-		sts	index_cal_settle_l, temp3
-		sts	index_cal_settle_h, temp4
-		ldi	temp1, INDEX_CAL_ALIGN_HOLD
-		sts	index_cal_state, temp1
-		rjmp	index_calibration_publish
-
-index_calibration_align_hold:
+index_calibration_acquire:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
-		brtc	index_calibration_align_no_timeout
+		brtc	index_calibration_acquire_no_timeout
 		rjmp	index_calibration_failed
-index_calibration_align_no_timeout:
-		brcs	index_calibration_align_done
+index_calibration_acquire_no_timeout:
+		brcs	index_calibration_acquire_done
 		ret
-index_calibration_align_done:
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
+index_calibration_acquire_done:
+		lds	temp1, index_cal_steps
+		inc	temp1
+		sts	index_cal_steps, temp1
+		cpi	temp1, INDEX_CAL_ACQUIRE_STEPS
+		brsh	index_calibration_acquire_complete
+		rcall	index_calibration_vector_forward
+		rcall	index_calibration_prepare_hold
+		rjmp	index_calibration_publish
+index_calibration_acquire_complete:
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sts	index_cal_start_l, temp1
 		sts	index_cal_start_h, temp2
-		sts	index_cal_previous_l, temp1
-		sts	index_cal_previous_h, temp2
+		sts	index_cal_endpoint_l, temp1
+		sts	index_cal_endpoint_h, temp2
+		sts	index_cal_steps, ZH
+		rcall	index_calibration_vector_forward
 		ldi	temp1, INDEX_CAL_SWEEP_FORWARD
 		sts	index_cal_state, temp1
-		ret
+		rcall	index_calibration_prepare_hold
+		rjmp	index_calibration_publish
 
 index_calibration_sweep_forward:
-		rcall	index_calibration_accumulate
-		lds	temp3, index_cal_field_l
-		lds	temp4, index_cal_field_h
-		subi	temp3, low(-INDEX_CAL_SWEEP_STEP)
-		sbci	temp4, high(-INDEX_CAL_SWEEP_STEP)
-		andi	temp4, 0x0f
-		sts	index_cal_field_l, temp3
-		sts	index_cal_field_h, temp4
-		rcall	index_calibration_tick_sweep
-		brcs	index_calibration_forward_done
-		rjmp	index_calibration_publish
-index_calibration_forward_done:
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		lds	temp1, index_angle_l
-		lds	temp2, index_angle_h
-		sts	index_cal_settle_l, temp1
-		sts	index_cal_settle_h, temp2
-		ldi	temp1, INDEX_CAL_FORWARD_HOLD
-		sts	index_cal_state, temp1
-		rjmp	index_calibration_publish
-
-index_calibration_forward_hold:
-		rcall	index_calibration_accumulate
+		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
 		brtc	index_calibration_forward_no_timeout
 		rjmp	index_calibration_failed
 index_calibration_forward_no_timeout:
-		brcs	index_calibration_forward_settled
+		brcs	index_calibration_forward_done
 		ret
-index_calibration_forward_settled:
+index_calibration_forward_done:
+		rcall	index_calibration_accumulate_endpoint
+		rcall	index_calibration_forward_step_valid
+		brcc	index_calibration_forward_step_ok
+		rjmp	index_calibration_failed
+index_calibration_forward_step_ok:
+		lds	temp1, index_cal_steps
+		inc	temp1
+		sts	index_cal_steps, temp1
+		cpi	temp1, INDEX_CAL_MEASURE_STEPS
+		brsh	index_calibration_forward_complete
+		rcall	index_calibration_vector_forward
+		rcall	index_calibration_prepare_hold
+		rjmp	index_calibration_publish
+index_calibration_forward_complete:
 		lds	temp1, index_cal_travel_l
 		lds	temp2, index_cal_travel_h
 		sts	index_cal_forward_l, temp1
 		sts	index_cal_forward_h, temp2
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		lds	temp1, index_angle_l
-		lds	temp2, index_angle_h
-		sts	index_cal_previous_l, temp1
-		sts	index_cal_previous_h, temp2
+		sts	index_cal_steps, ZH
+		rcall	index_calibration_vector_reverse
 		ldi	temp1, INDEX_CAL_SWEEP_REVERSE
 		sts	index_cal_state, temp1
-		ret
+		rcall	index_calibration_prepare_hold
+		rjmp	index_calibration_publish
 
 index_calibration_sweep_reverse:
-		rcall	index_calibration_accumulate
-		lds	temp3, index_cal_field_l
-		lds	temp4, index_cal_field_h
-		subi	temp3, low(INDEX_CAL_SWEEP_STEP)
-		sbci	temp4, high(INDEX_CAL_SWEEP_STEP)
-		andi	temp4, 0x0f
-		sts	index_cal_field_l, temp3
-		sts	index_cal_field_h, temp4
-		rcall	index_calibration_tick_sweep
-		brcs	index_calibration_reverse_done
-		rjmp	index_calibration_publish
-index_calibration_reverse_done:
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sts	index_cal_stable, ZH
-		lds	temp1, index_angle_l
-		lds	temp2, index_angle_h
-		sts	index_cal_settle_l, temp1
-		sts	index_cal_settle_h, temp2
-		ldi	temp1, INDEX_CAL_FINAL_HOLD
-		sts	index_cal_state, temp1
-		rjmp	index_calibration_publish
-
-	; Carry is set after the configured number of complete electrical revolutions.
-index_calibration_tick_sweep:
-		lds	temp1, index_cal_ticks_l
-		lds	temp2, index_cal_ticks_h
-		subi	temp1, 0xff
-		sbci	temp2, 0xff
-		sts	index_cal_ticks_l, temp1
-		sts	index_cal_ticks_h, temp2
-		cpi	temp1, low(INDEX_CAL_SWEEP_TICKS)
-		brne	index_calibration_tick_more
-		cpi	temp2, high(INDEX_CAL_SWEEP_TICKS)
-		brne	index_calibration_tick_more
-		sts	index_cal_ticks_l, ZH
-		sts	index_cal_ticks_h, ZH
-		sec
-		ret
-index_calibration_tick_more:
-		clc
-		ret
-
-index_calibration_final_hold:
-		rcall	index_calibration_accumulate
+		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
-		brtc	index_calibration_final_no_timeout
+		brtc	index_calibration_reverse_no_timeout
 		rjmp	index_calibration_failed
-index_calibration_final_no_timeout:
-		brcs	index_calibration_validate
+index_calibration_reverse_no_timeout:
+		brcs	index_calibration_reverse_done
 		ret
+index_calibration_reverse_done:
+		rcall	index_calibration_accumulate_endpoint
+		rcall	index_calibration_reverse_step_valid
+		brcc	index_calibration_reverse_step_ok
+		rjmp	index_calibration_failed
+index_calibration_reverse_step_ok:
+		lds	temp1, index_cal_steps
+		inc	temp1
+		sts	index_cal_steps, temp1
+		cpi	temp1, INDEX_CAL_MEASURE_STEPS
+		brsh	index_calibration_validate
+		rcall	index_calibration_vector_reverse
+		rcall	index_calibration_prepare_hold
+		rjmp	index_calibration_publish
 
 	; Validate return position, opposite sweep directions, travel agreement,
 	; and the integer pole-pair fit. Successful fields are written before the
@@ -4835,9 +4682,9 @@ index_as5600_error:
 		sec
 		ret
 
-	; Homing uses the calibrated operating pulse width. The continuous PI result
-	; directly sets pulse density; calibration breakaway data is not substituted
-	; into position control. Zero command coasts with no braking interval.
+	; Homing uses its fixed safe pulse width. The continuous PI result directly
+	; sets pulse density; the legacy EEPROM breakaway field is not used. Zero
+	; command coasts with no braking interval.
 index_six_step_update:
 		lds	temp1, index_q_command
 		tst	temp1

@@ -36,8 +36,8 @@
 
 ; Board-level electrical safety limits. Change these only after checking the
 ; gate waveform and phase current on the actual hardware. This is a hard ceiling
-; for sparse calibration excitation. Homing uses the converted threshold in its
-; separate 20 kHz pulse-width range.
+; and fixed pulse width for sparse calibration excitation. Homing uses its own
+; fixed 3.5 us pulse in the separate 20 kHz pulse-density path.
 .equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse at 5 kHz effective / 4% average duty
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay around a six-step vector change
 

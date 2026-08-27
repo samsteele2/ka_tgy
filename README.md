@@ -58,12 +58,12 @@ The EEPROM record contains:
 - mechanical home and its validity marker;
 - encoder direction and pole-pair count;
 - electrical-angle offset;
-- calibrated low-side operating pulse width;
-- measured breakaway density; and
-- electrical record marker `0x5e`, written last as the commit.
+- fixed homing low-side pulse width;
+- a legacy nonzero density field retained for EEPROM layout compatibility; and
+- electrical record marker `0x5f`, written last as the commit.
 
-Breakaway density remains part of the electrical-calibration record but is not
-used by the position controller.
+The legacy density field is not measured and is not used by the position
+controller.
 
 ## Electrical calibration
 
@@ -75,18 +75,20 @@ motor-current decay.
 
 | Phase | Behavior |
 |---|---|
-| Initial hold | Apply vector 0 at minimum pulse width until motion remains inside the encoder-noise band for 64 samples (262.144 ms). Timeout is approximately 3 s. |
-| Excitation search | Alternate vectors 0 and 1 every 12 samples while increasing pulse width by eight Timer2 cycles (0.5 us). Require four consecutive samples beyond the full noise band before accepting movement. |
-| Operating pulse | Save the measured threshold and use threshold + 16 Timer2 cycles (1 us), capped by `INDEX_CAL_DUTY_MAX`. |
-| Alignment | Hold vector 0 until mechanically settled. |
-| Forward sweep | Advance the field by 8/4096 electrical revolution per update for two electrical revolutions, then settle. |
-| Reverse sweep | Return through two electrical revolutions and settle. |
-| Validation | Require opposite travel signs, matched magnitudes, return to the initial position, 1–20 pole pairs, and bounded pole-fit error. |
-| Commit | Calculate direction, pole pairs, electrical offset, pulse width, and breakaway density; write the validity marker last. |
+| Initial hold | Apply vector 0 with the fixed calibration waveform until it satisfies the settling consensus. |
+| Acquisition | Step through one complete six-vector electrical revolution. Settle at every vector and discard all acquisition travel. |
+| Forward measurement | Step through 12 vectors (two electrical revolutions). Do not advance until the current vector has settled; accumulate only settled endpoint-to-endpoint travel. |
+| Reverse measurement | Return through 12 settled vector steps and accumulate endpoint travel independently. |
+| Per-step validation | Require settled endpoint displacement from 7 through 1024 encoder counts and a consistent direction. Reverse steps must have the opposite sign. |
+| Geometry validation | Require return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and pole-fit error below 129 counts. |
+| Commit | Calculate encoder direction, pole pairs, and electrical offset; write marker `0x5f` last. |
 
-With `INDEX_CAL_NOISE_DELTA = 3`, settling permits a three-count instantaneous
-delta and six-count total window excursion. Movement proof requires at least
-seven counts from baseline for four consecutive samples.
+With `INDEX_CAL_NOISE_DELTA = 3`, settling requires 64 consecutive samples
+(262.144 ms) with no sample jump above three counts and no excursion beyond six
+counts from the stable-window origin. Each vector has a three-second timeout.
+This consensus window is used directly instead of calculating a separate mean;
+transient samples are excluded from all geometry measurements. The minimum
+successful calibration time is approximately 8.1 seconds.
 
 ### Calibration frequency rationale
 
@@ -133,11 +135,11 @@ Only the sink is pulsed. A vector transition performs:
 4. another `INDEX_DEADTIME_US` delay; and
 5. start low-side pulses on the sink phase.
 
-Calibration uses 7.0-8.0 us low-side pulses at 5 kHz effective, for 3.5-4.0%
-average applied duty. The measured sparse-pulse threshold is converted to the
-homing timer domain; homing retains 3.5-4.0 us pulses and an 8-bit first-order
-accumulator varies their density from 0 to 255 frames at a 20 kHz carrier. Zero
-controller output coasts; indexing never applies dynamic braking.
+With the current configuration, calibration uses fixed 8.0 us low-side pulses
+at 5 kHz effective, for 4.0% average applied duty. Homing uses a separate fixed
+3.5 us pulse, and an 8-bit first-order accumulator varies its density from 0 to
+255 frames at a 20 kHz carrier. Zero controller output coasts; indexing never
+applies dynamic braking.
 
 ## Position-control specification
 
@@ -178,8 +180,8 @@ Current checked-in values are:
 
 | Setting | Value | Effective behavior |
 |---|---:|---|
-| `INDEX_P_GAIN` | 8 | P = 0.50 |
-| `INDEX_I_GAIN` | 4 | I = 0.25 |
+| `INDEX_P_GAIN` | 6 | P = 0.375 |
+| `INDEX_I_GAIN` | 3 | I = 0.1875 |
 | `INDEX_I_MAX` | 16348 | Symmetric integral-accumulator clamp |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
 
@@ -202,7 +204,7 @@ cycle.
 
 The controller is substantially simpler, but these behaviors are intentional:
 
-- With P = 0.50, position errors of approximately 510 counts or more saturate the
+- With P = 0.375, position errors of approximately 680 counts or more saturate the
   output immediately. Most initial home steps therefore begin at maximum pulse
   density.
 - The integral can still reach its clamp during a saturated approach, although
@@ -212,7 +214,7 @@ The controller is substantially simpler, but these behaviors are intentional:
   vectors.
 - The exact 180-degree position error has two equivalent paths; signed wrapping
   selects one.
-- Position control uses the calibrated pulse width but has no current feedback.
+- Position control uses a fixed safe pulse width but has no current feedback.
 
 Tune P first, then introduce I only as needed to overcome steady position error.
 Use `INDEX_I_MAX` to bound the maximum stored integral torque.
@@ -248,8 +250,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6256 application bytes and 108 bytes of SRAM,
-leaving 912 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 5864 application bytes and 106 bytes of SRAM,
+leaving 1304 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:
