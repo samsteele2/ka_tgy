@@ -253,8 +253,24 @@
 ; only enable/commissioning, controller, and electrical safety settings.
 .equ	INDEX_CONTROL_PERIOD_US = 4096
 .equ	INDEX_DELAY_OVF = (INDEX_START_DELAY_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
+.equ	INDEX_HOME_TIMEOUT_TICKS = (INDEX_HOME_TIMEOUT_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
+; Q8 mechanical counts/update. For the fixed 4096 us service period this is
+; rpm * 4096 counts/rev * 4096 us/update * 256 / 60,000,000 us/min.
+.equ	INDEX_HOME_SLEW_STEP_Q8 = (INDEX_HOME_SLEW_RPM * 16777216 + 117187) / 234375
+.equ	INDEX_HOME_SLEW_STEP_COUNTS = INDEX_HOME_SLEW_STEP_Q8 / 256
+.equ	INDEX_HOME_SLEW_STEP_FRACTION = low(INDEX_HOME_SLEW_STEP_Q8)
+.equ	INDEX_HOME_MAX_LEAD_COUNTS = (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES * 4096 + 180) / 360
 .if (INDEX_START_DELAY_SECONDS < 1) || (INDEX_START_DELAY_SECONDS > 30)
 .error "INDEX_START_DELAY_SECONDS must be in the range 1..30"
+.endif
+.if (INDEX_HOME_SLEW_RPM < 1) || (INDEX_HOME_SLEW_RPM > 120)
+.error "INDEX_HOME_SLEW_RPM must be in the range 1..120 mechanical RPM"
+.endif
+.if (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES < 1) || (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES > 360)
+.error "INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES must be in the range 1..360"
+.endif
+.if (INDEX_HOME_TIMEOUT_SECONDS < 1) || (INDEX_HOME_TIMEOUT_SECONDS > 60)
+.error "INDEX_HOME_TIMEOUT_SECONDS must be in the range 1..60"
 .endif
 .equ	INDEX_SETTLE_DELTA = 2		; Maximum motion on terminal release
 .equ	INDEX_TRACK_I_SHIFT = 5
@@ -331,6 +347,7 @@
 .equ	INDEX_CONTROL_DUE = 4
 .equ	INDEX_PWM_RUNNING = 5
 .equ	INDEX_CALIBRATING = 6
+.equ	INDEX_TARGET_AT_HOME = 7
 .equ	INDEX_CAL_BASE_HOLD = 1
 .equ	INDEX_CAL_ACQUIRE = 2
 .equ	INDEX_CAL_SWEEP_FORWARD = 3
@@ -498,6 +515,11 @@ index_wait_l:	.byte	1	; 4.096 ms Timer1-overflow ticks since throttle went low
 index_wait_h:	.byte	1
 index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
 index_angle_h:	.byte	1
+index_target_l: .byte 1	; Slewed mechanical position demand, 0..4095
+index_target_h: .byte 1
+index_target_fraction: .byte 1 ; Q8 rate remainder for four/five-count stepping
+index_home_ticks_l: .byte 1	; 4.096 ms ticks since the homing trajectory began
+index_home_ticks_h: .byte 1
 index_electrical_l: .byte 1	; Rotor electrical angle, 0..4095
 index_electrical_h: .byte 1
 index_voltage_l: .byte 1	; Requested q-axis voltage-vector angle, 0..4095
@@ -509,7 +531,7 @@ index_pwm_density: .byte 1	; Requested pulse density, 0..255
 index_pwm_accumulator: .byte 1 ; First-order deterministic density accumulator
 index_previous_angle_l: .byte 1 ; Previous AS5600 angle for terminal motion test
 index_previous_angle_h: .byte 1
-index_previous_error_l: .byte 1 ; Previous signed home error for zero-cross reset
+index_previous_error_l: .byte 1 ; Previous signed target error for zero-cross reset
 index_previous_error_h: .byte 1
 index_integral_l: .byte 1	; Signed continuously active position-error integral
 index_integral_h: .byte 1
@@ -3581,22 +3603,20 @@ index_poll:	lds	temp1, index_state
 		rjmp	index_calibration_start
 index_home_begin:
 		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_CALIBRATING)-(1<<INDEX_PWM_RUNNING)
+		andi	temp1, 0xff-(1<<INDEX_CALIBRATING)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_TARGET_AT_HOME)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)
 		sts	index_state, temp1
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sts	index_previous_angle_l, temp1
 		sts	index_previous_angle_h, temp2
-		lds	temp3, index_home_l
-		lds	temp4, index_home_h
-		sub	temp3, temp1
-		sbc	temp4, temp2
-		andi	temp4, 0x0f
-		sbrc	temp4, 3
-		ori	temp4, 0xf0
-		sts	index_previous_error_l, temp3
-		sts	index_previous_error_h, temp4
+		sts	index_target_l, temp1
+		sts	index_target_h, temp2
+		sts	index_target_fraction, ZH
+		sts	index_home_ticks_l, ZH
+		sts	index_home_ticks_h, ZH
+		sts	index_previous_error_l, ZH
+		sts	index_previous_error_h, ZH
 		sts	index_pwm_density, ZH
 		sts	index_pwm_accumulator, ZH
 		sts	index_q_command, ZH
@@ -3610,7 +3630,7 @@ index_poll_ret:
 		ret
 index_sensor_fault:
 		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
+		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)-(1<<INDEX_TARGET_AT_HOME)
 		sts	index_state, temp1
 		rcall	switch_power_off
 		rcall	beep_f1			; AS5600 missing/unresponsive after stop delay
@@ -3652,11 +3672,24 @@ index_service:
 		.endif
 		ret
 
-	; Direct step command to mechanical home. There is no target trajectory, speed
-	; limiter, feed-forward term, or position-control breakaway substitution.
+	; Advance a mechanical target at the configured rate, then let the unchanged
+	; PI law track that target. Homing has its own elapsed-time watchdog.
 index_position_step:
-		lds	temp3, index_home_l
-		lds	temp4, index_home_h
+		lds	temp1, index_home_ticks_l
+		lds	temp2, index_home_ticks_h
+		subi	temp1, 0xff
+		sbci	temp2, 0xff
+		sts	index_home_ticks_l, temp1
+		sts	index_home_ticks_h, temp2
+		cpi	temp1, low(INDEX_HOME_TIMEOUT_TICKS)
+		ldi	temp3, high(INDEX_HOME_TIMEOUT_TICKS)
+		cpc	temp2, temp3
+		brlo	index_position_within_time
+		rjmp	index_home_timeout
+index_position_within_time:
+		rcall	index_target_update
+		lds	temp3, index_target_l
+		lds	temp4, index_target_h
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sub	temp3, temp1
@@ -3664,7 +3697,7 @@ index_position_step:
 		andi	temp4, 0x0f		; Wrap modulo one mechanical revolution
 		sbrc	temp4, 3
 		ori	temp4, 0xf0		; Sign-extend the 12-bit difference
-		movw	XL, temp3		; X = signed home-minus-position error
+		movw	XL, temp3		; X = signed target-minus-position error
 
 	; Raw signed rotor delta is used only for the terminal low-motion test.
 		lds	temp3, index_angle_l
@@ -3679,8 +3712,11 @@ index_position_step:
 		sbrc	temp4, 3
 		ori	temp4, 0xf0
 
-	; Release the bridge when position is inside the configured angular deadzone
-	; and instantaneous raw motion is small. Completion is terminal for this cycle.
+	; Release only after the trajectory itself has reached home, position is inside
+	; the configured angular deadzone, and instantaneous raw motion is small.
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_TARGET_AT_HOME
+		rjmp	index_pi_continue
 		movw	temp1, XL
 		sbrs	temp2, 7
 		rjmp	index_pi_position_absolute
@@ -3691,7 +3727,9 @@ index_pi_position_absolute:
 		cpi	temp1, low(INDEX_HOME_DEADZONE_COUNTS + 1)
 		ldi	YL, high(INDEX_HOME_DEADZONE_COUNTS + 1)
 		cpc	temp2, YL
-		brsh	index_pi_continue
+		brlo	index_pi_position_inside
+		rjmp	index_pi_continue
+index_pi_position_inside:
 		movw	temp1, temp3
 		sbrs	temp2, 7
 		rjmp	index_pi_velocity_absolute
@@ -3700,17 +3738,141 @@ index_pi_position_absolute:
 		sbci	temp2, 0xff
 index_pi_velocity_absolute:
 		tst	temp2
-		brne	index_pi_continue
+		breq	index_pi_velocity_high_zero
+		rjmp	index_pi_continue
+index_pi_velocity_high_zero:
 		cpi	temp1, INDEX_SETTLE_DELTA + 1
-		brsh	index_pi_continue
+		brlo	index_pi_settled
+		rjmp	index_pi_continue
+index_pi_settled:
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rcall	index_home_complete
 		ret
 
+	; Keep the stored target inside one configured electrical-angle lead of the
+	; measured rotor. A sudden external displacement beyond the bound reanchors the
+	; trajectory at the rotor; ordinary resistance simply pauses further advance.
+index_target_update:
+		lds	XL, index_target_l
+		lds	XH, index_target_h
+		rcall	index_target_lead_valid
+		brcc	index_target_current_valid
+		lds	XL, index_angle_l
+		lds	XH, index_angle_h
+		sts	index_target_l, XL
+		sts	index_target_h, XH
+		sts	index_target_fraction, ZH
+index_target_current_valid:
+		lds	temp3, index_home_l
+		lds	temp4, index_home_h
+		sub	temp3, XL
+		sbc	temp4, XH
+		andi	temp4, 0x0f
+		sbrc	temp4, 3
+		ori	temp4, 0xf0
+		mov	temp1, temp3
+		or	temp1, temp4
+		brne	index_target_has_distance
+		lds	temp1, index_state
+		ori	temp1, (1<<INDEX_TARGET_AT_HOME)
+		sts	index_state, temp1
+		ret
+
+index_target_has_distance:
+		clr	YH			; YH = 0 increasing angle, 1 decreasing angle
+		sbrs	temp4, 7
+		rjmp	index_target_distance_absolute
+		inc	YH
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_target_distance_absolute:
+		lds	YL, index_target_fraction
+		ldi	temp1, INDEX_HOME_SLEW_STEP_FRACTION
+		add	YL, temp1
+		sts	index_target_fraction, YL
+		ldi	temp1, INDEX_HOME_SLEW_STEP_COUNTS
+		adc	temp1, ZH		; Fraction carry selects the occasional extra count
+		tst	temp1
+		breq	index_target_mark_moving
+
+		clt				; T marks a candidate that lands exactly at home
+		tst	temp4
+		brne	index_target_full_step
+		cp	temp1, temp3
+		brlo	index_target_full_step
+		lds	XL, index_home_l
+		lds	XH, index_home_h
+		set
+		rjmp	index_target_candidate_ready
+index_target_full_step:
+		tst	YH
+		brne	index_target_step_negative
+		add	XL, temp1
+		adc	XH, ZH
+		rjmp	index_target_step_wrapped
+index_target_step_negative:
+		sub	XL, temp1
+		sbc	XH, ZH
+index_target_step_wrapped:
+		andi	XH, 0x0f
+index_target_candidate_ready:
+		rcall	index_target_lead_valid
+		brcs	index_target_mark_moving
+		sts	index_target_l, XL
+		sts	index_target_h, XH
+		brtc	index_target_mark_moving
+		lds	temp1, index_state
+		ori	temp1, (1<<INDEX_TARGET_AT_HOME)
+		sts	index_state, temp1
+		ret
+index_target_mark_moving:
+		lds	temp1, index_state
+		andi	temp1, 0xff-(1<<INDEX_TARGET_AT_HOME)
+		sts	index_state, temp1
+		ret
+
+	; Carry is clear when candidate X is no farther from the measured rotor than
+	; the configured electrical lead. Multiplication by the calibrated pole count
+	; avoids division and preserves the exact electrical-angle safety comparison.
+index_target_lead_valid:
+		movw	temp3, XL
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrs	temp4, 3
+		rjmp	index_target_lead_absolute
+		ori	temp4, 0xf0
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_target_lead_absolute:
+		clr	YL
+		clr	YH
+		lds	temp1, index_pole_pairs
+		tst	temp1
+		breq	index_target_lead_invalid
+index_target_lead_multiply:
+		add	YL, temp3
+		adc	YH, temp4
+		dec	temp1
+		brne	index_target_lead_multiply
+		cpi	YL, low(INDEX_HOME_MAX_LEAD_COUNTS + 1)
+		ldi	temp1, high(INDEX_HOME_MAX_LEAD_COUNTS + 1)
+		cpc	YH, temp1
+		brsh	index_target_lead_invalid
+		clc
+		ret
+index_target_lead_invalid:
+		sec
+		ret
+
 index_pi_continue:
 	; Clear stored integral whenever the signed error crosses zero. Exact zero also
-	; clears it, preventing residual torque while the rotor passes through home.
+	; clears it, preventing residual torque while the rotor passes through target.
 		lds	temp1, index_previous_error_l
 		lds	temp2, index_previous_error_h
 		mov	temp3, XL
@@ -3999,6 +4161,8 @@ index_sector_rounded:
 	; armed latch; a later accepted throttle command starts normal SimonK and
 	; rearms the next high-to-low indexing event.
 index_home_complete:
+		sts	index_pwm_density, ZH
+		sts	index_q_command, ZH
 		rcall	switch_power_off
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		sts	index_previous_error_l, ZH
@@ -4011,6 +4175,21 @@ index_home_complete:
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
 		out	TWCR, ZH
+		ret
+
+	; Five low pulses uniquely report that the rotor did not satisfy the normal
+	; home completion criteria before the trajectory watchdog expired.
+index_home_timeout:
+		rcall	index_home_complete
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
+		rcall	wait30ms
+		rcall	beep_f1
 		ret
 
 	; Use one fixed, current-limited waveform. A discarded six-vector revolution
@@ -4573,7 +4752,7 @@ index_calibration_commit_read_ok:
 index_calibration_failed:
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
+		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)-(1<<INDEX_TARGET_AT_HOME)
 		sts	index_state, temp1
 		rcall	switch_power_off
 		rcall	beep_f1			; Four low pulses: electrical calibration rejected

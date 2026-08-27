@@ -40,9 +40,10 @@ service calibration or positioning at zero throttle.
    invalid.
 6. If the electrical record is invalid, run electrical calibration and commit
    the result.
-7. Apply a direct position step to mechanical home and run the PI controller.
-8. When position and motion are within tolerance, turn the complete bridge off
-   until another nonzero run.
+7. Initialize the position target at the measured rotor angle, slew it toward
+   mechanical home, and run the PI controller against that moving target.
+8. After the target reaches home, turn the complete bridge off when position
+   and motion are within tolerance. Abort after eight seconds if it cannot settle.
 
 A new nonzero throttle command always cancels calibration or positioning and
 returns control to SimonK.
@@ -117,7 +118,8 @@ Failure behavior:
 
 - AS5600 transaction failure: bridge off, two low beeps;
 - missing mechanical home: bridge off, three low beeps;
-- rejected electrical calibration: bridge off, four low beeps.
+- rejected electrical calibration: bridge off, four low beeps; and
+- homing timeout: bridge off, five low beeps.
 
 ## Index power stage
 
@@ -146,18 +148,28 @@ applies dynamic braking.
 Angles use AS5600 counts: 4096 counts per mechanical revolution. Position and
 sample-to-sample motion are wrapped to the signed range -2048 to 2047.
 
-### Direct step
+### Slewed target
 
-At index start, the demanded position immediately becomes mechanical home.
-There is no target trajectory, acceleration limit, RPM limit, taper, or
-feed-forward term.
+At index start, the demanded position is initialized to the measured rotor
+angle. It then follows the shortest mechanical path toward home at
+`INDEX_HOME_SLEW_RPM`. At the checked-in 15 RPM setting and 4.096 ms update
+period, a fractional accumulator advances the target by four or five AS5600
+counts per update for approximately the configured average rate.
+
+The target is permitted to lead the measured rotor by at most
+`INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES`. The checked-in 360-degree limit is
+evaluated using the calibrated pole-pair count. If the rotor falls behind, the
+target pauses before crossing the limit. If an external displacement has
+already put it outside the limit, the target is reanchored at the measured
+rotor position. This bounds stored trajectory separation after a stick-slip
+event; it is not a rotor-speed controller.
 
 ### PI law
 
 Every 4.096 ms:
 
 ```text
-error[k] = wrapped(home - position[k])
+error[k] = wrapped(target[k] - position[k])
 if error[k] crossed zero:
     integral[k-1] = 0
 integral[k] = clamp(integral[k-1] + error[k], -I_MAX, I_MAX)
@@ -170,9 +182,11 @@ P and I are configured in sixteenths. Integral action runs on every control
 update, including while output is saturated and while the rotor is moving. The
 accumulator is cleared when the signed position error changes sign or is exactly
 zero, preventing stored torque from continuing in the old direction after the
-rotor crosses home. Between crossings, `INDEX_I_MAX` bounds its magnitude.
+rotor crosses the moving target. Between crossings, `INDEX_I_MAX` bounds its
+magnitude.
 
-The signed command is saturated to -255 through 255. Its magnitude directly
+Once the target reaches home, the same law naturally becomes home-position PI
+control. The signed command is saturated to -255 through 255. Its magnitude directly
 sets pulse density and its sign selects torque direction. There is no stall
 counter, dead-zone inversion, learned minimum output, or homing breakaway pulse.
 
@@ -184,10 +198,14 @@ Current checked-in values are:
 | `INDEX_I_GAIN` | 3 | I = 0.1875 |
 | `INDEX_I_MAX` | 16348 | Symmetric integral-accumulator clamp |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
+| `INDEX_HOME_SLEW_RPM` | 15 | Mechanical target slew rate |
+| `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | 360 | Maximum target-to-rotor separation |
+| `INDEX_HOME_TIMEOUT_SECONDS` | 8 | Maximum homing duration |
 
 ### Completion
 
-Homing completes when both conditions are true:
+Homing completes only after the moving target has reached mechanical home and
+both existing terminal conditions are true:
 
 - absolute position error is inside `INDEX_HOME_DEADZONE_MINUTES`; and
 - absolute raw one-sample rotor delta is at most two counts.
@@ -198,20 +216,24 @@ one degree. Firmware converts it to the nearest AS5600 count at assembly time;
 home.
 
 Completion immediately turns the bridge off and is terminal for that stopped
-cycle.
+cycle. If these conditions have not been met after
+`INDEX_HOME_TIMEOUT_SECONDS`, the firmware turns the bridge off and emits five
+low beeps.
 
 ## Remaining predictable edge cases
 
 The controller is substantially simpler, but these behaviors are intentional:
 
-- With P = 0.375, position errors of approximately 680 counts or more saturate the
-  output immediately. Most initial home steps therefore begin at maximum pulse
-  density.
+- With P = 0.375, target-tracking errors of approximately 680 counts or more
+  saturate the proportional output.
 - The integral can still reach its clamp during a saturated approach, although
-  crossing home clears it before accumulation begins in the opposite direction.
+  crossing the moving target clears it before accumulation begins in the
+  opposite direction.
 - There is no derivative term or electronic velocity damping.
 - Output remains quantized by 8-bit pulse density and six 60-degree electrical
   vectors.
+- The trajectory limits target separation, but there is no direct rotor-speed
+  feedback or acceleration controller.
 - The exact 180-degree position error has two equivalent paths; signed wrapping
   selects one.
 - Position control uses a fixed safe pulse width but has no current feedback.
@@ -231,6 +253,9 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
+| `INDEX_HOME_SLEW_RPM` | Mechanical target slew rate toward home. |
+| `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | Maximum target lead over the measured rotor. |
+| `INDEX_HOME_TIMEOUT_SECONDS` | Homing watchdog before the five-beep abort. |
 | `INDEX_CAL_NOISE_DELTA` | Electrical-calibration encoder-noise band. |
 | `INDEX_CAL_DUTY_MAX` | 128 cycles: 8.0 us at 5 kHz effective / 4% average-duty ceiling. |
 | `INDEX_DEADTIME_US` | All-off delay around vector changes. |
@@ -250,8 +275,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 5864 application bytes and 106 bytes of SRAM,
-leaving 1304 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6184 application bytes and 111 bytes of SRAM,
+leaving 984 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

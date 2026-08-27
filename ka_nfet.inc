@@ -25,13 +25,16 @@
 .equ	INDEX_DRIVE_ENABLE		= 1	; Set to 0 for sensor-only commissioning
 .equ	INDEX_START_DELAY_SECONDS = 5	; Coast time after throttle reaches zero
 
-; Step-response position controller. P and I are in sixteenths: 4 means 0.25.
+; Slewed-target position controller. P and I are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is
 ; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
 .equ	INDEX_P_GAIN			= 6
 .equ	INDEX_I_GAIN			= 3
 .equ	INDEX_I_MAX				= 16348
 .equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 3 degrees from home
+.equ	INDEX_HOME_SLEW_RPM		= 15	; Mechanical target speed toward home
+.equ	INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES = 360 ; Target-to-rotor safety bound
+.equ	INDEX_HOME_TIMEOUT_SECONDS = 8	; Abort incomplete homing with five low beeps
 .equ	INDEX_CAL_NOISE_DELTA	= 3	; Electrical-calibration encoder-noise threshold
 
 ; Board-level electrical safety limits. Change these only after checking the
