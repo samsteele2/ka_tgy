@@ -24,6 +24,7 @@
 .equ	INDEX_ENABLE			= 1	; Compile the AS5600 home-index feature
 .equ	INDEX_DRIVE_ENABLE		= 1	; Set to 0 for sensor-only commissioning
 .equ	INDEX_START_DELAY_SECONDS = 5	; Coast time after throttle reaches zero
+.equ	INDEX_POLE_PAIRS		= 7	; 12N14P motor: 14 rotor poles / 2
 
 ; Slewed-target position controller. P and I are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is

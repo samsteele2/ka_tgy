@@ -1,7 +1,7 @@
 # KA nFET ESC firmware
 
 Experimental ATmega8A firmware for PCB-783B1-02. Normal operation uses the
-existing SimonK sensorless ESC code. This fork adds AS5600 electrical calibration
+existing SimonK sensorless ESC code. This fork adds AS5600 electrical alignment
 and post-run positioning to a stored mechanical home.
 
 For installation, normal operation, and fault-code checks, see
@@ -41,8 +41,8 @@ service calibration or positioning at zero throttle.
    `INDEX_START_DELAY_SECONDS`.
 5. Read the AS5600. Abort with the bridge off if the sensor or stored home is
    invalid.
-6. If the electrical record is invalid, run electrical calibration and commit
-   the result.
+6. If the electrical record is invalid, align encoder direction and electrical
+   zero using the configured motor pole count, then commit the result.
 7. Initialize the position target at the measured rotor angle, slew it toward
    mechanical home, and run the PI controller against that moving target.
 8. After the target reaches home, turn the complete bridge off when position
@@ -60,7 +60,7 @@ is recalibrated on the next eligible stop.
 The EEPROM record contains:
 
 - mechanical home and its validity marker;
-- encoder direction and pole-pair count;
+- encoder direction and the configured pole-pair count;
 - electrical-angle offset;
 - fixed homing low-side pulse width;
 - a legacy nonzero density field retained for EEPROM layout compatibility; and
@@ -68,6 +68,11 @@ The EEPROM record contains:
 
 The legacy density field is not measured and is not used by the position
 controller.
+
+`INDEX_POLE_PAIRS` is compiled from `ka_nfet.inc` and copied into the committed
+electrical record. On boot, a different stored value invalidates that record and
+forces a new electrical alignment before homing. The checked-in value is 7 for
+the standard 12-slot, 14-pole motor arrangement.
 
 ## Electrical calibration
 
@@ -84,8 +89,7 @@ motor-current decay.
 | Forward measurement | Step through 12 vectors (two electrical revolutions). Do not advance until the current vector has settled; accumulate only settled endpoint-to-endpoint travel. |
 | Reverse measurement | Return through 12 settled vector steps and accumulate endpoint travel independently. |
 | Per-step validation | Permit zero-motion, reversed, and catch-up steps. Reject only a gross settled endpoint jump above 1024 encoder counts. |
-| Robust pole fit | In each direction, discard the smallest settled pole movement and the largest catch-up movement; average the remaining ten steps from both directions. |
-| Geometry validation | Determine direction from complete sweeps; require opposite aggregate directions, return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and robust pole-fit error below 129 counts. |
+| Geometry validation | Determine direction from complete sweeps; require opposite aggregate directions, return within 32 counts, forward/reverse travel within 32 counts, and sufficient total movement. Pole count is not estimated. |
 | Commit | Average the two vector-zero endpoints reached from opposite directions, calculate the electrical offset, and write marker `0x60` last. |
 
 With `INDEX_CAL_NOISE_DELTA = 3`, settling requires 64 consecutive samples
@@ -125,13 +129,12 @@ Failure behavior:
 - electrical-calibration settling timeout: bridge off, four low beeps;
 - homing timeout: bridge off, five low beeps;
 - gross calibration step above 1024 counts: bridge off, six low beeps;
-- aggregate sweep direction, return, or travel rejection: bridge off, seven low beeps;
-- pole-count or pole-fit rejection: bridge off, eight low beeps; and
+- aggregate sweep direction, return, or travel rejection: bridge off, seven low beeps; and
 - invalid internal calibration state: bridge off, nine low beeps.
 
 ## Index power stage
 
-The calibrated pole count, encoder direction, and electrical offset convert
+The configured pole count, calibrated encoder direction, and electrical offset convert
 mechanical angle to rotor electrical angle. Controller sign requests positive or
 negative 90-degree electrical torque angle, rounded to the nearest of six active
 vectors.
@@ -166,7 +169,7 @@ counts per update for approximately the configured average rate.
 
 The target is permitted to lead the measured rotor by at most
 `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES`. The checked-in 360-degree limit is
-evaluated using the calibrated pole-pair count. If the rotor falls behind, the
+evaluated using the configured pole-pair count. If the rotor falls behind, the
 target pauses before crossing the limit. If an external displacement has
 already put it outside the limit, the target is reanchored at the measured
 rotor position. This bounds stored trajectory separation after a stick-slip
@@ -258,6 +261,7 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_ENABLE` | Compile AS5600 indexing. |
 | `INDEX_DRIVE_ENABLE` | Set to 0 for sensor-only commissioning. |
 | `INDEX_START_DELAY_SECONDS` | All-off coast time after zero throttle. |
+| `INDEX_POLE_PAIRS` | Rotor pole-pair count. Use 7 for a standard 12N14P motor. |
 | `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |

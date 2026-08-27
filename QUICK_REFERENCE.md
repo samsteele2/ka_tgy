@@ -13,12 +13,13 @@ The homing target moves at about 15 rotor RPM. Homing stops when the rotor is at
 home and nearly stationary. A homing attempt is cancelled immediately by a new
 nonzero throttle command and is aborted if it takes longer than eight seconds.
 
-The position controller must execute an electrical calibration to sense the
-physical motor configuration. Any changes to motor mounting, motor wiring, encoder
-magnet, or encoder mounting require a recallibration by following the steps outlined
-under the next section, "Initial commissioning". Electrical calibration causes a
+The checked-in firmware is configured for a standard 12-slot, 14-pole motor
+(`INDEX_POLE_PAIRS = 7`). Electrical calibration aligns encoder direction and
+electrical zero; it does not estimate the pole count. Any changes to motor
+mounting, motor wiring, encoder magnet, or encoder mounting require recalibration
+by following the steps under "Initial commissioning". Calibration causes a
 sequence of small forward and reverse rotor steps and an audible tone. This is
-expected. The motor must be allowed to freely rotate during this time.
+expected. The motor must be allowed to rotate freely during this time.
 
 ## Initial commissioning
 
@@ -78,7 +79,7 @@ cancels that operation and returns control to normal motor operation.
   sequence.
 - Some individual steps may be very small, reverse briefly, or catch up on a
   later step. The complete sequence is what is checked.
-- A 5 kHz electrical tone may be audible.
+- An approximately 6 kHz electrical tone may be audible.
 - A successful calibration takes at least about eight seconds and may take
   longer while the rotor settles.
 - After calibration, the rotor proceeds directly into the normal slow homing
@@ -98,7 +99,6 @@ system off before inspecting it.
 | 5 | Homing did not finish within eight seconds | Check for an obstruction, excessive friction, a slipping propeller assembly, or inability to hold the home position. |
 | 6 | Calibration detected an implausibly large rotor step | Check the encoder magnet and mounting, intermittent sensor wiring, and sudden mechanical movement. |
 | 7 | Complete calibration sweeps did not agree | Check for a blocked or binding shaft and make sure the propeller or load is not forcing inconsistent forward and reverse movement. |
-| 8 | Pole-count measurement was inconsistent | Check for skipped motion, low calibration torque, encoder problems, or a mechanically unstable load. |
 | 9 | Invalid internal calibration state | Cycle power once. If it repeats, reflash the verified HEX and report the fault. |
 
 Startup tones and throttle-calibration acknowledgments are not fault codes.

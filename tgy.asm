@@ -272,6 +272,9 @@
 .if (INDEX_HOME_TIMEOUT_SECONDS < 1) || (INDEX_HOME_TIMEOUT_SECONDS > 60)
 .error "INDEX_HOME_TIMEOUT_SECONDS must be in the range 1..60"
 .endif
+.if (INDEX_POLE_PAIRS < 1) || (INDEX_POLE_PAIRS > 20)
+.error "INDEX_POLE_PAIRS must be in the range 1..20"
+.endif
 .equ	INDEX_SETTLE_DELTA = 2		; Maximum motion on terminal release
 .equ	INDEX_TRACK_I_SHIFT = 5
 .equ	INDEX_DENSITY_MAX = 255
@@ -311,18 +314,13 @@
 .equ	INDEX_CAL_SETTLE_WINDOW = INDEX_CAL_NOISE_DELTA * 2
 .equ	INDEX_CAL_SETTLE_SAMPLES = 64	; 262.144 ms continuously stable
 .equ	INDEX_CAL_SETTLE_TIMEOUT_TICKS = 733	; 3.002 s maximum per hold
-.equ	INDEX_CAL_SWEEP_REVOLUTIONS = 2	; Average endpoint nonlinearity over two pole pitches
-.equ	INDEX_CAL_SWEEP_COUNTS = 4096 * INDEX_CAL_SWEEP_REVOLUTIONS
+.equ	INDEX_CAL_SWEEP_REVOLUTIONS = 2	; Align over two electrical revolutions
 .equ	INDEX_CAL_ACQUIRE_STEPS = 6	; One discarded electrical revolution
 .equ	INDEX_CAL_MEASURE_STEPS = 6 * INDEX_CAL_SWEEP_REVOLUTIONS
-.equ	INDEX_CAL_TRIMMED_STEPS = INDEX_CAL_MEASURE_STEPS - 2
-.equ	INDEX_CAL_TRIMMED_COUNTS = (INDEX_CAL_SWEEP_COUNTS * INDEX_CAL_TRIMMED_STEPS + INDEX_CAL_MEASURE_STEPS / 2) / INDEX_CAL_MEASURE_STEPS
 .equ	INDEX_CAL_STEP_MAX = 1024	; Reject implausible settled pole jumps
-.equ	INDEX_CAL_MAX_POLE_PAIRS = 20
 .equ	INDEX_CAL_MIN_TRAVEL = 360
 .equ	INDEX_CAL_TRAVEL_MATCH = 32
 .equ	INDEX_CAL_RETURN_TOLERANCE = 32
-.equ	INDEX_CAL_POLE_FIT = 128
 .equ	INDEX_PWM_CARRIER_HZ = 20000
 .equ	INDEX_PWM_PERIOD_CYCLES = F_CPU / INDEX_PWM_CARRIER_HZ
 .if F_CPU % INDEX_PWM_CARRIER_HZ
@@ -355,7 +353,6 @@
 .equ	INDEX_CAL_FAIL_SETTLE = 4	; Four low beeps
 .equ	INDEX_CAL_FAIL_STEP = 6		; Six: implausibly large settled step
 .equ	INDEX_CAL_FAIL_RETURN = 7	; Seven: sweep direction/return/travel
-.equ	INDEX_CAL_FAIL_POLE = 8		; Eight: pole count or fit
 .equ	INDEX_CAL_FAIL_INTERNAL = 9	; Nine: impossible calibration state
 .endif
 
@@ -558,14 +555,6 @@ index_cal_travel_l: .byte 1	; Signed unwrapped travel for the current sweep
 index_cal_travel_h: .byte 1
 index_cal_forward_l: .byte 1	; Signed forward-sweep travel
 index_cal_forward_h: .byte 1
-index_cal_trim_sum_l: .byte 1	; Absolute per-pole travel sum for current sweep
-index_cal_trim_sum_h: .byte 1
-index_cal_trim_min_l: .byte 1	; Smallest settled pole movement (discarded)
-index_cal_trim_min_h: .byte 1
-index_cal_trim_max_l: .byte 1	; Largest settled pole movement (discarded)
-index_cal_trim_max_h: .byte 1
-index_cal_trim_forward_l: .byte 1 ; Forward sum after min/max rejection
-index_cal_trim_forward_h: .byte 1
 .endif
 motor_count:	.byte	1	; Motor number for serial control
 brake_sub:	.byte	1	; Brake speed subtrahend (power of two)
@@ -597,7 +586,7 @@ index_home_h:	.byte	1	; Calibrated AS5600 mechanical home, high byte (0..15)
 index_home_valid: .byte 1	; INDEX_HOME_MARKER when home was successfully captured
 index_electrical_offset_l: .byte 1 ; Automatically calibrated electrical offset
 index_electrical_offset_h: .byte 1
-index_pole_pairs: .byte 1	; Automatically measured motor pole-pair count
+index_stored_pole_pairs: .byte 1 ; Configured pole-pair count committed with alignment
 index_encoder_reverse: .byte 1	; 0: counts follow field sweep, 1: counts are reversed
 index_pwm_duty_l: .byte 1	; Fixed Timer2 pulse width used by homing density control
 index_pwm_duty_h: .byte 1
@@ -3508,8 +3497,8 @@ index_home_invalid:
 		sec
 		ret
 
-	; Carry clear means that the automatically measured direction, pole-pair
-	; count, and electrical offset form a complete committed EEPROM record.
+	; Carry clear means that the measured direction/electrical offset and the
+	; configured pole-pair count form a complete committed EEPROM record.
 index_electrical_is_valid:
 		lds	temp1, index_electrical_valid
 		cpi	temp1, INDEX_ELECTRICAL_MARKER
@@ -3517,11 +3506,9 @@ index_electrical_is_valid:
 		lds	temp1, index_electrical_offset_h
 		cpi	temp1, 0x10
 		brsh	index_electrical_invalid
-		lds	temp1, index_pole_pairs
-		tst	temp1
-		breq	index_electrical_invalid
-		cpi	temp1, INDEX_CAL_MAX_POLE_PAIRS + 1
-		brsh	index_electrical_invalid
+		lds	temp1, index_stored_pole_pairs
+		cpi	temp1, INDEX_POLE_PAIRS
+		brne	index_electrical_invalid
 		lds	temp1, index_encoder_reverse
 		cpi	temp1, 2
 		brsh	index_electrical_invalid
@@ -3847,7 +3834,7 @@ index_target_mark_moving:
 		ret
 
 	; Carry is clear when candidate X is no farther from the measured rotor than
-	; the configured electrical lead. Multiplication by the calibrated pole count
+	; the configured electrical lead. Multiplication by the configured pole count
 	; avoids division and preserves the exact electrical-angle safety comparison.
 index_target_lead_valid:
 		movw	temp3, XL
@@ -3865,7 +3852,7 @@ index_target_lead_valid:
 index_target_lead_absolute:
 		clr	YL
 		clr	YH
-		lds	temp1, index_pole_pairs
+		ldi	temp1, INDEX_POLE_PAIRS
 		tst	temp1
 		breq	index_target_lead_invalid
 index_target_lead_multiply:
@@ -4079,13 +4066,13 @@ index_pi_scale_ret:
 		ret
 
 	; Convert mechanical encoder angle using the automatically calibrated
-	; direction, pole-pair count, and electrical offset stored in EEPROM.
+	; direction, configured pole-pair count, and electrical offset stored in EEPROM.
 index_position_electrical:
 		lds	temp3, index_angle_l
 		lds	temp4, index_angle_h
 		clr	temp1
 		clr	temp2
-		lds	YL, index_pole_pairs
+		ldi	YL, INDEX_POLE_PAIRS
 		tst	YL
 		breq	index_electrical_unavailable
 index_electrical_add:
@@ -4296,59 +4283,6 @@ index_calibration_accumulate_endpoint:
 		sts	index_cal_travel_h, temp2
 		ret
 
-	; Robust pole-step estimator. Each direction records twelve settled endpoint
-	; movements. The smallest movement (a stuck step) and largest movement (its
-	; likely catch-up step) are removed before pole count and fit are calculated.
-index_calibration_trim_reset:
-		sts	index_cal_trim_sum_l, ZH
-		sts	index_cal_trim_sum_h, ZH
-		sts	index_cal_trim_max_l, ZH
-		sts	index_cal_trim_max_h, ZH
-		ldi	temp1, 0xff
-		sts	index_cal_trim_min_l, temp1
-		sts	index_cal_trim_min_h, temp1
-		ret
-
-	; Input temp4:temp3 is the absolute, validated settled endpoint movement.
-index_calibration_trim_accumulate:
-		lds	temp1, index_cal_trim_sum_l
-		lds	temp2, index_cal_trim_sum_h
-		add	temp1, temp3
-		adc	temp2, temp4
-		sts	index_cal_trim_sum_l, temp1
-		sts	index_cal_trim_sum_h, temp2
-		lds	temp1, index_cal_trim_min_l
-		lds	temp2, index_cal_trim_min_h
-		cp	temp3, temp1
-		cpc	temp4, temp2
-		brsh	index_calibration_trim_check_max
-		sts	index_cal_trim_min_l, temp3
-		sts	index_cal_trim_min_h, temp4
-index_calibration_trim_check_max:
-		lds	temp1, index_cal_trim_max_l
-		lds	temp2, index_cal_trim_max_h
-		cp	temp1, temp3
-		cpc	temp2, temp4
-		brsh	index_calibration_trim_accumulate_done
-		sts	index_cal_trim_max_l, temp3
-		sts	index_cal_trim_max_h, temp4
-index_calibration_trim_accumulate_done:
-		ret
-
-	; Return the current direction's trimmed absolute travel in temp2:temp1.
-index_calibration_trim_finalize:
-		lds	temp1, index_cal_trim_sum_l
-		lds	temp2, index_cal_trim_sum_h
-		lds	temp3, index_cal_trim_min_l
-		lds	temp4, index_cal_trim_min_h
-		sub	temp1, temp3
-		sbc	temp2, temp4
-		lds	temp3, index_cal_trim_max_l
-		lds	temp4, index_cal_trim_max_h
-		sub	temp1, temp3
-		sbc	temp2, temp4
-		ret
-
 	; Consume signed sample motion in temp4:temp3. Carry is set only after the
 	; required number of consecutive stable samples. T is set on timeout so each
 	; caller can reject calibration without hiding a return address on the stack.
@@ -4437,7 +4371,7 @@ index_calibration_vector_reverse_decrement:
 
 	; Individual vectors may stick, reverse, or catch up under a dynamic load.
 	; Reject only a gross endpoint jump; complete sweeps determine direction,
-	; travel, return accuracy, and pole count.
+	; travel, return accuracy, and electrical alignment.
 index_calibration_step_valid:
 		sbrs	temp4, 7
 		rjmp	index_calibration_step_absolute
@@ -4513,7 +4447,6 @@ index_calibration_acquire_done:
 index_calibration_acquire_complete:
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
-		rcall	index_calibration_trim_reset
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sts	index_cal_start_l, temp1
@@ -4541,7 +4474,6 @@ index_calibration_forward_done:
 		brcc	index_calibration_forward_step_ok
 		rjmp	index_calibration_fail_step
 index_calibration_forward_step_ok:
-		rcall	index_calibration_trim_accumulate
 		lds	temp1, index_cal_steps
 		inc	temp1
 		sts	index_cal_steps, temp1
@@ -4555,10 +4487,6 @@ index_calibration_forward_complete:
 		lds	temp2, index_cal_travel_h
 		sts	index_cal_forward_l, temp1
 		sts	index_cal_forward_h, temp2
-		rcall	index_calibration_trim_finalize
-		sts	index_cal_trim_forward_l, temp1
-		sts	index_cal_trim_forward_h, temp2
-		rcall	index_calibration_trim_reset
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
 		sts	index_cal_steps, ZH
@@ -4582,25 +4510,18 @@ index_calibration_reverse_done:
 		brcc	index_calibration_reverse_step_ok
 		rjmp	index_calibration_fail_step
 index_calibration_reverse_step_ok:
-		rcall	index_calibration_trim_accumulate
 		lds	temp1, index_cal_steps
 		inc	temp1
 		sts	index_cal_steps, temp1
 		cpi	temp1, INDEX_CAL_MEASURE_STEPS
-		brsh	index_calibration_reverse_complete
+		brsh	index_calibration_validate
 		rcall	index_calibration_vector_reverse
 		rcall	index_calibration_prepare_hold
 		rjmp	index_calibration_publish
 
-index_calibration_reverse_complete:
-		rcall	index_calibration_trim_finalize
-		sts	index_cal_trim_sum_l, temp1
-		sts	index_cal_trim_sum_h, temp2
-		rjmp	index_calibration_validate
-
-	; Validate return position, opposite sweep directions, travel agreement,
-	; and the integer pole-pair fit. Successful fields are written before the
-	; validity marker, so power loss cannot commit a partial calibration.
+	; Validate return position, opposite sweep directions, and travel agreement.
+	; Successful fields are written before the validity marker, so power loss
+	; cannot commit a partial alignment.
 index_calibration_validate:
 		lds	temp3, index_angle_l
 		lds	temp4, index_angle_h
@@ -4702,8 +4623,7 @@ index_calibration_difference_ok:
 		sts	index_cal_forward_l, temp1
 		sts	index_cal_forward_h, temp2
 
-		; Reject too little motion before estimating
-		; round(INDEX_CAL_SWEEP_COUNTS / travel).
+		; Reject too little motion before committing the configured motor geometry.
 		lds	temp3, index_cal_forward_l
 		lds	temp4, index_cal_forward_h
 		cpi	temp3, low(INDEX_CAL_MIN_TRAVEL)
@@ -4712,72 +4632,10 @@ index_calibration_difference_ok:
 		brcc	index_calibration_travel_large_enough
 		rjmp	index_calibration_fail_return
 index_calibration_travel_large_enough:
-		; Average the independently trimmed forward/reverse per-pole travel sums.
-		; Ten central samples remain from each twelve-step sweep.
-		lds	temp3, index_cal_trim_forward_l
-		lds	temp4, index_cal_trim_forward_h
-		lds	temp1, index_cal_trim_sum_l
-		lds	temp2, index_cal_trim_sum_h
-		add	temp1, temp3
-		adc	temp2, temp4
-		lsr	temp2
-		ror	temp1
-		movw	temp3, temp1
-		movw	XL, temp3
-		ldi	YL, 1
-index_calibration_pole_loop:
-		cpi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
-		ldi	temp1, high(INDEX_CAL_TRIMMED_COUNTS)
-		cpc	XH, temp1
-		brsh	index_calibration_pole_crossed
-		add	XL, temp3
-		adc	XH, temp4
-		inc	YL
-		cpi	YL, INDEX_CAL_MAX_POLE_PAIRS + 1
-		brlo	index_calibration_pole_loop
-		rjmp	index_calibration_fail_pole
-index_calibration_pole_crossed:
-		subi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
-		sbci	XH, high(INDEX_CAL_TRIMMED_COUNTS)
-		movw	temp1, XL
-		lsl	temp1
-		rol	temp2
-		cp	temp3, temp1
-		cpc	temp4, temp2
-		brcc	index_calibration_pole_selected
-		dec	YL
-index_calibration_pole_selected:
-		tst	YL
-		brne	index_calibration_pole_nonzero
-		rjmp	index_calibration_fail_pole
-index_calibration_pole_nonzero:
-		sts	index_pole_pairs, YL
-
-	; Validate pole_pairs * robust trimmed travel against its commanded span.
-		clr	XL
-		clr	XH
-		mov	temp1, YL
-index_calibration_fit_loop:
-		add	XL, temp3
-		adc	XH, temp4
-		dec	temp1
-		brne	index_calibration_fit_loop
-		subi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
-		sbci	XH, high(INDEX_CAL_TRIMMED_COUNTS)
-		sbrs	XH, 7
-		rjmp	index_calibration_fit_positive
-		com	XH
-		neg	XL
-		sbci	XH, 0xff
-index_calibration_fit_positive:
-		tst	XH
-		breq	index_calibration_fit_high_zero
-		rjmp	index_calibration_fail_pole
-index_calibration_fit_high_zero:
-		cpi	XL, INDEX_CAL_POLE_FIT + 1
-		brlo	index_calibration_fit_valid
-		rjmp	index_calibration_fail_pole
-index_calibration_fit_valid:
+		; Pole geometry is a board/motor configuration, not a noisy measurement.
+		; Calibration now aligns encoder direction and electrical zero only.
+		ldi	YL, INDEX_POLE_PAIRS
+		sts	index_stored_pole_pairs, YL
 
 		; Offset uses the circular midpoint of the forward- and reverse-arrival
 		; vector-zero endpoints to reduce directional friction and backlash bias.
@@ -4785,7 +4643,7 @@ index_calibration_fit_valid:
 		lds	temp4, index_cal_endpoint_h
 		clr	XL
 		clr	XH
-		lds	YL, index_pole_pairs
+		ldi	YL, INDEX_POLE_PAIRS
 index_calibration_offset_loop:
 		add	XL, temp3
 		adc	XH, temp4
@@ -4820,7 +4678,7 @@ index_calibration_commit_read_ok:
 
 	; Low-beep counts are unique across index-mode failures: two sensor, three
 	; missing home, four settle timeout, five homing timeout, six gross step,
-	; seven aggregate sweep/return, eight pole fit, and nine internal state.
+	; seven aggregate sweep/return, and nine internal state.
 index_calibration_fail_settle:
 		ldi	XL, INDEX_CAL_FAIL_SETTLE
 		rjmp	index_calibration_failed
@@ -4829,9 +4687,6 @@ index_calibration_fail_step:
 		rjmp	index_calibration_failed
 index_calibration_fail_return:
 		ldi	XL, INDEX_CAL_FAIL_RETURN
-		rjmp	index_calibration_failed
-index_calibration_fail_pole:
-		ldi	XL, INDEX_CAL_FAIL_POLE
 		rjmp	index_calibration_failed
 index_calibration_fail_internal:
 		ldi	XL, INDEX_CAL_FAIL_INTERNAL
