@@ -298,7 +298,7 @@
 .equ	INDEX_AS5600_ANGLE_REG = 0x0e
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
 .equ	INDEX_HOME_MARKER = 0xa5
-.equ	INDEX_ELECTRICAL_MARKER = 0x5f	; Settled-endpoint calibration record
+.equ	INDEX_ELECTRICAL_MARKER = 0x60	; Aggregate sweep / averaged-offset record
 
 ; Calibration emits one pulse per four 20 kHz frames. Doubling the individual
 ; pulse width preserves Timer2 timing margin while halving average bridge duty
@@ -308,7 +308,6 @@
 .equ	INDEX_HOME_DUTY_MIN = MIN_DUTY
 .equ	INDEX_HOME_DUTY_MAX = 64
 .equ	INDEX_CAL_DUTY_MIN = MIN_DUTY * 2
-.equ	INDEX_CAL_MOVE_COUNTS = INDEX_CAL_NOISE_DELTA * 2 + 1
 .equ	INDEX_CAL_SETTLE_DELTA = INDEX_CAL_NOISE_DELTA
 .equ	INDEX_CAL_SETTLE_WINDOW = INDEX_CAL_NOISE_DELTA * 2
 .equ	INDEX_CAL_SETTLE_SAMPLES = 64	; 262.144 ms continuously stable
@@ -352,6 +351,11 @@
 .equ	INDEX_CAL_ACQUIRE = 2
 .equ	INDEX_CAL_SWEEP_FORWARD = 3
 .equ	INDEX_CAL_SWEEP_REVERSE = 4
+.equ	INDEX_CAL_FAIL_SETTLE = 4	; Four low beeps
+.equ	INDEX_CAL_FAIL_STEP = 6		; Six: implausibly large settled step
+.equ	INDEX_CAL_FAIL_RETURN = 7	; Seven: sweep direction/return/travel
+.equ	INDEX_CAL_FAIL_POLE = 8		; Eight: pole count or fit
+.equ	INDEX_CAL_FAIL_INTERNAL = 9	; Nine: impossible calibration state
 .endif
 
 .equ	PWR_COOL_START	= (POWER_RANGE/24) ; Power limit while starting to reduce heating
@@ -4369,61 +4373,20 @@ index_calibration_vector_reverse_decrement:
 		sts	index_cal_vector, temp1
 		ret
 
-	; Validate a settled forward step. The first step establishes raw encoder
-	; direction; later steps must agree and remain inside broad geometry bounds.
-index_calibration_forward_step_valid:
-		clr	YL
+	; Individual vectors may stick, reverse, or catch up under a dynamic load.
+	; Reject only a gross endpoint jump; complete sweeps determine direction,
+	; travel, return accuracy, and pole count.
+index_calibration_step_valid:
 		sbrs	temp4, 7
-		rjmp	index_calibration_forward_step_absolute
-		inc	YL
+		rjmp	index_calibration_step_absolute
 		com	temp4
 		neg	temp3
 		sbci	temp4, 0xff
-index_calibration_forward_step_absolute:
-		tst	temp4
-		brne	index_calibration_forward_step_min_ok
-		cpi	temp3, INDEX_CAL_MOVE_COUNTS
-		brlo	index_calibration_step_invalid
-index_calibration_forward_step_min_ok:
+index_calibration_step_absolute:
 		cpi	temp3, low(INDEX_CAL_STEP_MAX + 1)
 		ldi	temp1, high(INDEX_CAL_STEP_MAX + 1)
 		cpc	temp4, temp1
 		brsh	index_calibration_step_invalid
-		lds	temp1, index_cal_steps
-		tst	temp1
-		brne	index_calibration_forward_direction_known
-		sts	index_encoder_reverse, YL
-		clc
-		ret
-index_calibration_forward_direction_known:
-		lds	temp1, index_encoder_reverse
-		cp	temp1, YL
-		brne	index_calibration_step_invalid
-		clc
-		ret
-
-	; Reverse endpoints require the same movement bounds and the opposite sign.
-index_calibration_reverse_step_valid:
-		clr	YL
-		sbrs	temp4, 7
-		rjmp	index_calibration_reverse_step_absolute
-		inc	YL
-		com	temp4
-		neg	temp3
-		sbci	temp4, 0xff
-index_calibration_reverse_step_absolute:
-		tst	temp4
-		brne	index_calibration_reverse_step_min_ok
-		cpi	temp3, INDEX_CAL_MOVE_COUNTS
-		brlo	index_calibration_step_invalid
-index_calibration_reverse_step_min_ok:
-		cpi	temp3, low(INDEX_CAL_STEP_MAX + 1)
-		ldi	temp1, high(INDEX_CAL_STEP_MAX + 1)
-		cpc	temp4, temp1
-		brsh	index_calibration_step_invalid
-		lds	temp1, index_encoder_reverse
-		cp	temp1, YL
-		breq	index_calibration_step_invalid
 		clc
 		ret
 index_calibration_step_invalid:
@@ -4449,14 +4412,14 @@ index_cal_not_forward:
 		brne	index_calibration_bad_state
 		rjmp	index_calibration_sweep_reverse
 index_calibration_bad_state:
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_internal
 
 	; Establish a quiet vector-zero start, then run one discarded acquisition turn.
 index_calibration_base_hold:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
 		brtc	index_calibration_base_no_timeout
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_settle
 index_calibration_base_no_timeout:
 		brcs	index_calibration_base_done
 		ret
@@ -4472,7 +4435,7 @@ index_calibration_acquire:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
 		brtc	index_calibration_acquire_no_timeout
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_settle
 index_calibration_acquire_no_timeout:
 		brcs	index_calibration_acquire_done
 		ret
@@ -4505,15 +4468,15 @@ index_calibration_sweep_forward:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
 		brtc	index_calibration_forward_no_timeout
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_settle
 index_calibration_forward_no_timeout:
 		brcs	index_calibration_forward_done
 		ret
 index_calibration_forward_done:
 		rcall	index_calibration_accumulate_endpoint
-		rcall	index_calibration_forward_step_valid
+		rcall	index_calibration_step_valid
 		brcc	index_calibration_forward_step_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_step
 index_calibration_forward_step_ok:
 		lds	temp1, index_cal_steps
 		inc	temp1
@@ -4541,15 +4504,15 @@ index_calibration_sweep_reverse:
 		rcall	index_calibration_delta
 		rcall	index_calibration_wait_settled
 		brtc	index_calibration_reverse_no_timeout
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_settle
 index_calibration_reverse_no_timeout:
 		brcs	index_calibration_reverse_done
 		ret
 index_calibration_reverse_done:
 		rcall	index_calibration_accumulate_endpoint
-		rcall	index_calibration_reverse_step_valid
+		rcall	index_calibration_step_valid
 		brcc	index_calibration_reverse_step_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_step
 index_calibration_reverse_step_ok:
 		lds	temp1, index_cal_steps
 		inc	temp1
@@ -4580,12 +4543,25 @@ index_calibration_validate:
 index_calibration_return_positive:
 		tst	temp4
 		breq	index_calibration_return_high_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_return_high_ok:
 		cpi	temp3, INDEX_CAL_RETURN_TOLERANCE + 1
 		brlo	index_calibration_return_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_return_ok:
+		; Midpoint of the vector-zero endpoints reached from opposite directions:
+		; midpoint(B,C) = C - (C-B)/2. Save it for the electrical-offset fit.
+		lds	temp3, index_cal_travel_l
+		lds	temp4, index_cal_travel_h
+		asr	temp4
+		ror	temp3
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		andi	temp2, 0x0f
+		sts	index_cal_endpoint_l, temp1
+		sts	index_cal_endpoint_h, temp2
 
 		; Make forward travel positive and remember whether encoder counts fell.
 		lds	temp3, index_cal_forward_l
@@ -4608,14 +4584,14 @@ index_calibration_forward_absolute:
 		tst	YL
 		brne	index_calibration_forward_was_negative
 		sbrs	temp2, 7
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 		com	temp2
 		neg	temp1
 		sbci	temp2, 0xff
 		rjmp	index_calibration_reverse_absolute
 index_calibration_forward_was_negative:
 		sbrc	temp2, 7
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_reverse_absolute:
 		sts	index_cal_travel_l, temp1
 		sts	index_cal_travel_h, temp2
@@ -4633,11 +4609,11 @@ index_calibration_forward_larger:
 index_calibration_compare_difference:
 		tst	temp2
 		breq	index_calibration_difference_high_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_difference_high_ok:
 		cpi	temp1, INDEX_CAL_TRAVEL_MATCH + 1
 		brlo	index_calibration_difference_ok
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_difference_ok:
 		; Average the two accepted magnitudes to reduce directional load bias.
 		lds	temp3, index_cal_forward_l
@@ -4659,7 +4635,7 @@ index_calibration_difference_ok:
 		ldi	temp1, high(INDEX_CAL_MIN_TRAVEL)
 		cpc	temp4, temp1
 		brcc	index_calibration_travel_large_enough
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_return
 index_calibration_travel_large_enough:
 		movw	XL, temp3
 		ldi	YL, 1
@@ -4673,7 +4649,7 @@ index_calibration_pole_loop:
 		inc	YL
 		cpi	YL, INDEX_CAL_MAX_POLE_PAIRS + 1
 		brlo	index_calibration_pole_loop
-		rjmp	index_calibration_failed
+		rjmp	index_calibration_fail_pole
 index_calibration_pole_crossed:
 		subi	XL, low(INDEX_CAL_SWEEP_COUNTS)
 		sbci	XH, high(INDEX_CAL_SWEEP_COUNTS)
@@ -4686,7 +4662,9 @@ index_calibration_pole_crossed:
 		dec	YL
 index_calibration_pole_selected:
 		tst	YL
-		breq	index_calibration_failed
+		brne	index_calibration_pole_nonzero
+		rjmp	index_calibration_fail_pole
+index_calibration_pole_nonzero:
 		sts	index_pole_pairs, YL
 
 		; Validate pole_pairs * measured travel against the commanded sweep.
@@ -4707,13 +4685,18 @@ index_calibration_fit_loop:
 		sbci	XH, 0xff
 index_calibration_fit_positive:
 		tst	XH
-		brne	index_calibration_failed
+		breq	index_calibration_fit_high_zero
+		rjmp	index_calibration_fail_pole
+index_calibration_fit_high_zero:
 		cpi	XL, INDEX_CAL_POLE_FIT + 1
-		brsh	index_calibration_failed
+		brlo	index_calibration_fit_valid
+		rjmp	index_calibration_fail_pole
+index_calibration_fit_valid:
 
-		; At the final settled field angle zero: offset = -sign*p*angle.
-		lds	temp3, index_angle_l
-		lds	temp4, index_angle_h
+		; Offset uses the circular midpoint of the forward- and reverse-arrival
+		; vector-zero endpoints to reduce directional friction and backlash bias.
+		lds	temp3, index_cal_endpoint_l
+		lds	temp4, index_cal_endpoint_h
 		clr	XL
 		clr	XH
 		lds	YL, index_pole_pairs
@@ -4749,19 +4732,37 @@ index_calibration_offset_store:
 index_calibration_commit_read_ok:
 		rjmp	index_home_begin
 
+	; Low-beep counts are unique across index-mode failures: two sensor, three
+	; missing home, four settle timeout, five homing timeout, six gross step,
+	; seven aggregate sweep/return, eight pole fit, and nine internal state.
+index_calibration_fail_settle:
+		ldi	XL, INDEX_CAL_FAIL_SETTLE
+		rjmp	index_calibration_failed
+index_calibration_fail_step:
+		ldi	XL, INDEX_CAL_FAIL_STEP
+		rjmp	index_calibration_failed
+index_calibration_fail_return:
+		ldi	XL, INDEX_CAL_FAIL_RETURN
+		rjmp	index_calibration_failed
+index_calibration_fail_pole:
+		ldi	XL, INDEX_CAL_FAIL_POLE
+		rjmp	index_calibration_failed
+index_calibration_fail_internal:
+		ldi	XL, INDEX_CAL_FAIL_INTERNAL
 index_calibration_failed:
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)-(1<<INDEX_TARGET_AT_HOME)
 		sts	index_state, temp1
 		rcall	switch_power_off
-		rcall	beep_f1			; Four low pulses: electrical calibration rejected
-		rcall	wait30ms
+		mov	YL, XL
+index_calibration_failure_beep:
 		rcall	beep_f1
+		dec	YL
+		breq	index_calibration_failure_done
 		rcall	wait30ms
-		rcall	beep_f1
-		rcall	wait30ms
-		rcall	beep_f1
+		rjmp	index_calibration_failure_beep
+index_calibration_failure_done:
 		ret
 
 	; Issue TWCR command in temp1 and wait for TWINT. Carry is set on timeout.

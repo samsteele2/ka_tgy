@@ -4,6 +4,9 @@ Experimental ATmega8A firmware for PCB-783B1-02. Normal operation uses the
 existing SimonK sensorless ESC code. This fork adds AS5600 electrical calibration
 and post-run positioning to a stored mechanical home.
 
+For installation, normal operation, and fault-code checks, see
+[QUICK_REFERENCE.md](QUICK_REFERENCE.md).
+
 > **Safety:** index mode controls voltage, not phase current. Use a
 > current-limited supply, begin below flight voltage, inspect all six gate
 > waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
@@ -61,7 +64,7 @@ The EEPROM record contains:
 - electrical-angle offset;
 - fixed homing low-side pulse width;
 - a legacy nonzero density field retained for EEPROM layout compatibility; and
-- electrical record marker `0x5f`, written last as the commit.
+- electrical record marker `0x60`, written last as the commit.
 
 The legacy density field is not measured and is not used by the position
 controller.
@@ -80,9 +83,9 @@ motor-current decay.
 | Acquisition | Step through one complete six-vector electrical revolution. Settle at every vector and discard all acquisition travel. |
 | Forward measurement | Step through 12 vectors (two electrical revolutions). Do not advance until the current vector has settled; accumulate only settled endpoint-to-endpoint travel. |
 | Reverse measurement | Return through 12 settled vector steps and accumulate endpoint travel independently. |
-| Per-step validation | Require settled endpoint displacement from 7 through 1024 encoder counts and a consistent direction. Reverse steps must have the opposite sign. |
-| Geometry validation | Require return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and pole-fit error below 129 counts. |
-| Commit | Calculate encoder direction, pole pairs, and electrical offset; write marker `0x5f` last. |
+| Per-step validation | Permit zero-motion, reversed, and catch-up steps. Reject only a gross settled endpoint jump above 1024 encoder counts. |
+| Geometry validation | Determine direction from complete sweeps; require opposite aggregate directions, return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and pole-fit error below 129 counts. |
+| Commit | Average the two vector-zero endpoints reached from opposite directions, calculate the electrical offset, and write marker `0x60` last. |
 
 With `INDEX_CAL_NOISE_DELTA = 3`, settling requires 64 consecutive samples
 (262.144 ms) with no sample jump above three counts and no excursion beyond six
@@ -118,8 +121,12 @@ Failure behavior:
 
 - AS5600 transaction failure: bridge off, two low beeps;
 - missing mechanical home: bridge off, three low beeps;
-- rejected electrical calibration: bridge off, four low beeps; and
-- homing timeout: bridge off, five low beeps.
+- electrical-calibration settling timeout: bridge off, four low beeps;
+- homing timeout: bridge off, five low beeps;
+- gross calibration step above 1024 counts: bridge off, six low beeps;
+- aggregate sweep direction, return, or travel rejection: bridge off, seven low beeps;
+- pole-count or pole-fit rejection: bridge off, eight low beeps; and
+- invalid internal calibration state: bridge off, nine low beeps.
 
 ## Index power stage
 
@@ -275,8 +282,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6184 application bytes and 111 bytes of SRAM,
-leaving 984 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6162 application bytes and 111 bytes of SRAM,
+leaving 1006 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:
