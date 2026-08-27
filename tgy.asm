@@ -283,8 +283,8 @@
 .if (INDEX_I_GAIN < 0) || (INDEX_I_GAIN > 255)
 .error "INDEX_I_GAIN must be in the range 0..255 (gain in sixteenths)"
 .endif
-.if (INDEX_I_MAX < 1) || (INDEX_I_MAX > 16384)
-.error "INDEX_I_MAX must be in the range 1..16384"
+.if (INDEX_I_MAX < 1) || (INDEX_I_MAX > 28672)
+.error "INDEX_I_MAX must be in the range 1..28672"
 .endif
 .if (INDEX_HOME_DEADZONE_MINUTES < 0) || (INDEX_HOME_DEADZONE_MINUTES > 10800)
 .error "INDEX_HOME_DEADZONE_MINUTES must be in the range 0..10800"
@@ -300,11 +300,10 @@
 .equ	INDEX_HOME_MARKER = 0xa5
 .equ	INDEX_ELECTRICAL_MARKER = 0x60	; Aggregate sweep / averaged-offset record
 
-; Calibration emits one pulse per four 20 kHz frames. Doubling the individual
-; pulse width preserves Timer2 timing margin while halving average bridge duty
-; and reducing low-side switching events from 20 kHz to 5 kHz. Homing remains
-; on the 20 kHz pulse-density carrier with the original pulse-width range.
-.equ	INDEX_CAL_PULSE_DENSITY = 64
+; Calibration emits 77 pulses per 256 20 kHz frames. This is approximately 20%
+; stronger than the former 64/256 setting while retaining the same 8 us pulse
+; width and Timer2 timing margin. Homing remains on its independent 20 kHz path.
+.equ	INDEX_CAL_PULSE_DENSITY = 77
 .equ	INDEX_HOME_DUTY_MIN = MIN_DUTY
 .equ	INDEX_HOME_DUTY_MAX = 64
 .equ	INDEX_CAL_DUTY_MIN = MIN_DUTY * 2
@@ -316,6 +315,8 @@
 .equ	INDEX_CAL_SWEEP_COUNTS = 4096 * INDEX_CAL_SWEEP_REVOLUTIONS
 .equ	INDEX_CAL_ACQUIRE_STEPS = 6	; One discarded electrical revolution
 .equ	INDEX_CAL_MEASURE_STEPS = 6 * INDEX_CAL_SWEEP_REVOLUTIONS
+.equ	INDEX_CAL_TRIMMED_STEPS = INDEX_CAL_MEASURE_STEPS - 2
+.equ	INDEX_CAL_TRIMMED_COUNTS = (INDEX_CAL_SWEEP_COUNTS * INDEX_CAL_TRIMMED_STEPS + INDEX_CAL_MEASURE_STEPS / 2) / INDEX_CAL_MEASURE_STEPS
 .equ	INDEX_CAL_STEP_MAX = 1024	; Reject implausible settled pole jumps
 .equ	INDEX_CAL_MAX_POLE_PAIRS = 20
 .equ	INDEX_CAL_MIN_TRAVEL = 360
@@ -557,6 +558,14 @@ index_cal_travel_l: .byte 1	; Signed unwrapped travel for the current sweep
 index_cal_travel_h: .byte 1
 index_cal_forward_l: .byte 1	; Signed forward-sweep travel
 index_cal_forward_h: .byte 1
+index_cal_trim_sum_l: .byte 1	; Absolute per-pole travel sum for current sweep
+index_cal_trim_sum_h: .byte 1
+index_cal_trim_min_l: .byte 1	; Smallest settled pole movement (discarded)
+index_cal_trim_min_h: .byte 1
+index_cal_trim_max_l: .byte 1	; Largest settled pole movement (discarded)
+index_cal_trim_max_h: .byte 1
+index_cal_trim_forward_l: .byte 1 ; Forward sum after min/max rejection
+index_cal_trim_forward_h: .byte 1
 .endif
 motor_count:	.byte	1	; Motor number for serial control
 brake_sub:	.byte	1	; Brake speed subtrahend (power of two)
@@ -4287,6 +4296,59 @@ index_calibration_accumulate_endpoint:
 		sts	index_cal_travel_h, temp2
 		ret
 
+	; Robust pole-step estimator. Each direction records twelve settled endpoint
+	; movements. The smallest movement (a stuck step) and largest movement (its
+	; likely catch-up step) are removed before pole count and fit are calculated.
+index_calibration_trim_reset:
+		sts	index_cal_trim_sum_l, ZH
+		sts	index_cal_trim_sum_h, ZH
+		sts	index_cal_trim_max_l, ZH
+		sts	index_cal_trim_max_h, ZH
+		ldi	temp1, 0xff
+		sts	index_cal_trim_min_l, temp1
+		sts	index_cal_trim_min_h, temp1
+		ret
+
+	; Input temp4:temp3 is the absolute, validated settled endpoint movement.
+index_calibration_trim_accumulate:
+		lds	temp1, index_cal_trim_sum_l
+		lds	temp2, index_cal_trim_sum_h
+		add	temp1, temp3
+		adc	temp2, temp4
+		sts	index_cal_trim_sum_l, temp1
+		sts	index_cal_trim_sum_h, temp2
+		lds	temp1, index_cal_trim_min_l
+		lds	temp2, index_cal_trim_min_h
+		cp	temp3, temp1
+		cpc	temp4, temp2
+		brsh	index_calibration_trim_check_max
+		sts	index_cal_trim_min_l, temp3
+		sts	index_cal_trim_min_h, temp4
+index_calibration_trim_check_max:
+		lds	temp1, index_cal_trim_max_l
+		lds	temp2, index_cal_trim_max_h
+		cp	temp1, temp3
+		cpc	temp2, temp4
+		brsh	index_calibration_trim_accumulate_done
+		sts	index_cal_trim_max_l, temp3
+		sts	index_cal_trim_max_h, temp4
+index_calibration_trim_accumulate_done:
+		ret
+
+	; Return the current direction's trimmed absolute travel in temp2:temp1.
+index_calibration_trim_finalize:
+		lds	temp1, index_cal_trim_sum_l
+		lds	temp2, index_cal_trim_sum_h
+		lds	temp3, index_cal_trim_min_l
+		lds	temp4, index_cal_trim_min_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		lds	temp3, index_cal_trim_max_l
+		lds	temp4, index_cal_trim_max_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		ret
+
 	; Consume signed sample motion in temp4:temp3. Carry is set only after the
 	; required number of consecutive stable samples. T is set on timeout so each
 	; caller can reject calibration without hiding a return address on the stack.
@@ -4451,6 +4513,7 @@ index_calibration_acquire_done:
 index_calibration_acquire_complete:
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
+		rcall	index_calibration_trim_reset
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sts	index_cal_start_l, temp1
@@ -4478,6 +4541,7 @@ index_calibration_forward_done:
 		brcc	index_calibration_forward_step_ok
 		rjmp	index_calibration_fail_step
 index_calibration_forward_step_ok:
+		rcall	index_calibration_trim_accumulate
 		lds	temp1, index_cal_steps
 		inc	temp1
 		sts	index_cal_steps, temp1
@@ -4491,6 +4555,10 @@ index_calibration_forward_complete:
 		lds	temp2, index_cal_travel_h
 		sts	index_cal_forward_l, temp1
 		sts	index_cal_forward_h, temp2
+		rcall	index_calibration_trim_finalize
+		sts	index_cal_trim_forward_l, temp1
+		sts	index_cal_trim_forward_h, temp2
+		rcall	index_calibration_trim_reset
 		sts	index_cal_travel_l, ZH
 		sts	index_cal_travel_h, ZH
 		sts	index_cal_steps, ZH
@@ -4514,14 +4582,21 @@ index_calibration_reverse_done:
 		brcc	index_calibration_reverse_step_ok
 		rjmp	index_calibration_fail_step
 index_calibration_reverse_step_ok:
+		rcall	index_calibration_trim_accumulate
 		lds	temp1, index_cal_steps
 		inc	temp1
 		sts	index_cal_steps, temp1
 		cpi	temp1, INDEX_CAL_MEASURE_STEPS
-		brsh	index_calibration_validate
+		brsh	index_calibration_reverse_complete
 		rcall	index_calibration_vector_reverse
 		rcall	index_calibration_prepare_hold
 		rjmp	index_calibration_publish
+
+index_calibration_reverse_complete:
+		rcall	index_calibration_trim_finalize
+		sts	index_cal_trim_sum_l, temp1
+		sts	index_cal_trim_sum_h, temp2
+		rjmp	index_calibration_validate
 
 	; Validate return position, opposite sweep directions, travel agreement,
 	; and the integer pole-pair fit. Successful fields are written before the
@@ -4637,11 +4712,22 @@ index_calibration_difference_ok:
 		brcc	index_calibration_travel_large_enough
 		rjmp	index_calibration_fail_return
 index_calibration_travel_large_enough:
+		; Average the independently trimmed forward/reverse per-pole travel sums.
+		; Ten central samples remain from each twelve-step sweep.
+		lds	temp3, index_cal_trim_forward_l
+		lds	temp4, index_cal_trim_forward_h
+		lds	temp1, index_cal_trim_sum_l
+		lds	temp2, index_cal_trim_sum_h
+		add	temp1, temp3
+		adc	temp2, temp4
+		lsr	temp2
+		ror	temp1
+		movw	temp3, temp1
 		movw	XL, temp3
 		ldi	YL, 1
 index_calibration_pole_loop:
-		cpi	XL, low(INDEX_CAL_SWEEP_COUNTS)
-		ldi	temp1, high(INDEX_CAL_SWEEP_COUNTS)
+		cpi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
+		ldi	temp1, high(INDEX_CAL_TRIMMED_COUNTS)
 		cpc	XH, temp1
 		brsh	index_calibration_pole_crossed
 		add	XL, temp3
@@ -4651,8 +4737,8 @@ index_calibration_pole_loop:
 		brlo	index_calibration_pole_loop
 		rjmp	index_calibration_fail_pole
 index_calibration_pole_crossed:
-		subi	XL, low(INDEX_CAL_SWEEP_COUNTS)
-		sbci	XH, high(INDEX_CAL_SWEEP_COUNTS)
+		subi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
+		sbci	XH, high(INDEX_CAL_TRIMMED_COUNTS)
 		movw	temp1, XL
 		lsl	temp1
 		rol	temp2
@@ -4667,7 +4753,7 @@ index_calibration_pole_selected:
 index_calibration_pole_nonzero:
 		sts	index_pole_pairs, YL
 
-		; Validate pole_pairs * measured travel against the commanded sweep.
+	; Validate pole_pairs * robust trimmed travel against its commanded span.
 		clr	XL
 		clr	XH
 		mov	temp1, YL
@@ -4676,8 +4762,8 @@ index_calibration_fit_loop:
 		adc	XH, temp4
 		dec	temp1
 		brne	index_calibration_fit_loop
-		subi	XL, low(INDEX_CAL_SWEEP_COUNTS)
-		sbci	XH, high(INDEX_CAL_SWEEP_COUNTS)
+		subi	XL, low(INDEX_CAL_TRIMMED_COUNTS)
+		sbci	XH, high(INDEX_CAL_TRIMMED_COUNTS)
 		sbrs	XH, 7
 		rjmp	index_calibration_fit_positive
 		com	XH

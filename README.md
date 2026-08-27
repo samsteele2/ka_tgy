@@ -11,7 +11,7 @@ For installation, normal operation, and fault-code checks, see
 > current-limited supply, begin below flight voltage, inspect all six gate
 > waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
 > limits each calibration pulse to 8.0 us. Calibration emits at most one pulse
-> per four 20 kHz frames (5 kHz effective, 4% average duty); this is not a
+> at 77/256 density (approximately 6.0 kHz effective, 4.8% average duty); this is not a
 > phase-current limit.
 
 ## System overview
@@ -23,7 +23,7 @@ For installation, normal operation, and fault-code checks, see
 | Command | RC PWM on PD2/INT0; legacy SimonK I2C is retained |
 | Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
 | Index update | 4.096 ms / 244.14 Hz |
-| Index drive | Sensored six-step; 20 kHz homing PDM, 5 kHz calibration pulses |
+| Index drive | Sensored six-step; 20 kHz homing PDM, 6 kHz calibration pulses |
 | Persistent data | Mechanical home and electrical calibration in EEPROM |
 | Firmware image | `ka_nfet.hex` |
 
@@ -72,8 +72,8 @@ controller.
 ## Electrical calibration
 
 Calibration logic runs every 4.096 ms and directly commands a stationary or
-slowly rotating six-step field. The low-side FET receives one pulse per four
-20 kHz carrier frames: 5 kHz effective. The selected high-side source remains
+slowly rotating six-step field. The low-side FET receives 77 pulses per 256
+20 kHz carrier frames: approximately 6.0 kHz effective. The selected high-side source remains
 on for the vector, but conducts phase current only during the low-side pulse and
 motor-current decay.
 
@@ -84,7 +84,8 @@ motor-current decay.
 | Forward measurement | Step through 12 vectors (two electrical revolutions). Do not advance until the current vector has settled; accumulate only settled endpoint-to-endpoint travel. |
 | Reverse measurement | Return through 12 settled vector steps and accumulate endpoint travel independently. |
 | Per-step validation | Permit zero-motion, reversed, and catch-up steps. Reject only a gross settled endpoint jump above 1024 encoder counts. |
-| Geometry validation | Determine direction from complete sweeps; require opposite aggregate directions, return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and pole-fit error below 129 counts. |
+| Robust pole fit | In each direction, discard the smallest settled pole movement and the largest catch-up movement; average the remaining ten steps from both directions. |
+| Geometry validation | Determine direction from complete sweeps; require opposite aggregate directions, return within 32 counts, forward/reverse travel within 32 counts, 1–20 pole pairs, and robust pole-fit error below 129 counts. |
 | Commit | Average the two vector-zero endpoints reached from opposite directions, calculate the electrical offset, and write marker `0x60` last. |
 
 With `INDEX_CAL_NOISE_DELTA = 3`, settling requires 64 consecutive samples
@@ -96,7 +97,7 @@ successful calibration time is approximately 8.1 seconds.
 
 ### Calibration frequency rationale
 
-The audible 5 kHz calibration pulse rate is intentional. Earlier calibration
+The audible approximately 6 kHz calibration pulse rate is intentional. Earlier calibration
 used a low-side pulse in every 20 kHz carrier frame. With the rotor stationary
 and therefore producing no back-EMF, the winding current did not decay
 sufficiently during the approximately 46 us off-time. Successive pulses
@@ -104,8 +105,8 @@ accumulated phase current, causing excessive supply current and high-side FET
 heating. Hardware testing showed approximately eight times less calibration
 input current after changing to an 8 us pulse every 200 us.
 
-Timer2 still runs at 20 kHz, but calibration emits only one pulse per four
-frames. The resulting 5 kHz winding-current and torque excitation can therefore
+Timer2 still runs at 20 kHz, but calibration emits at 77/256 pulse density.
+The resulting approximately 6 kHz winding-current and torque excitation can therefore
 be audible. Restoring an ultrasonic *electrical excitation* is not considered a
 safe timing-only change: it would require substantially shorter pulses, closed-
 loop phase-current regulation, or an actively controlled fast-decay state. The
@@ -145,7 +146,7 @@ Only the sink is pulsed. A vector transition performs:
 5. start low-side pulses on the sink phase.
 
 With the current configuration, calibration uses fixed 8.0 us low-side pulses
-at 5 kHz effective, for 4.0% average applied duty. Homing uses a separate fixed
+at approximately 6.0 kHz effective, for 4.8% average applied duty. Homing uses a separate fixed
 3.5 us pulse, and an 8-bit first-order accumulator varies its density from 0 to
 255 frames at a 20 kHz carrier. Zero controller output coasts; indexing never
 applies dynamic braking.
@@ -201,9 +202,9 @@ Current checked-in values are:
 
 | Setting | Value | Effective behavior |
 |---|---:|---|
-| `INDEX_P_GAIN` | 6 | P = 0.375 |
-| `INDEX_I_GAIN` | 3 | I = 0.1875 |
-| `INDEX_I_MAX` | 16348 | Symmetric integral-accumulator clamp |
+| `INDEX_P_GAIN` | 8 | P = 0.5 |
+| `INDEX_I_GAIN` | 4 | I = 0.25 |
+| `INDEX_I_MAX` | 24576 | Symmetric integral-accumulator clamp |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
 | `INDEX_HOME_SLEW_RPM` | 15 | Mechanical target slew rate |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | 360 | Maximum target-to-rotor separation |
@@ -264,7 +265,7 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | Maximum target lead over the measured rotor. |
 | `INDEX_HOME_TIMEOUT_SECONDS` | Homing watchdog before the five-beep abort. |
 | `INDEX_CAL_NOISE_DELTA` | Electrical-calibration encoder-noise band. |
-| `INDEX_CAL_DUTY_MAX` | 128 cycles: 8.0 us at 5 kHz effective / 4% average-duty ceiling. |
+| `INDEX_CAL_DUTY_MAX` | 128 cycles: 8.0 us at 6.0 kHz effective / 4.8% average-duty ceiling. |
 | `INDEX_DEADTIME_US` | All-off delay around vector changes. |
 
 Protocol constants, state values, validation tolerances, and fixed-point scales

@@ -28,9 +28,9 @@
 ; Slewed-target position controller. P and I are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is
 ; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
-.equ	INDEX_P_GAIN			= 6
-.equ	INDEX_I_GAIN			= 3
-.equ	INDEX_I_MAX				= 16348
+.equ	INDEX_P_GAIN			= 8
+.equ	INDEX_I_GAIN			= 4
+.equ	INDEX_I_MAX				= 24576
 .equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 3 degrees from home
 .equ	INDEX_HOME_SLEW_RPM		= 15	; Mechanical target speed toward home
 .equ	INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES = 360 ; Target-to-rotor safety bound
@@ -41,7 +41,7 @@
 ; gate waveform and phase current on the actual hardware. This is a hard ceiling
 ; and fixed pulse width for sparse calibration excitation. Homing uses its own
 ; fixed 3.5 us pulse in the separate 20 kHz pulse-density path.
-.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse at 5 kHz effective / 4% average duty
+.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse at 6.0 kHz effective / 4.8% average duty
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay around a six-step vector change
 
 ;*********************
