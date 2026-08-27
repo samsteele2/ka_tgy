@@ -24,23 +24,21 @@
 .equ	INDEX_ENABLE			= 1	; Compile the AS5600 home-index feature
 .equ	INDEX_DRIVE_ENABLE		= 1	; Set to 0 for sensor-only commissioning
 .equ	INDEX_START_DELAY_SECONDS = 5	; Coast time after throttle reaches zero
-.equ	INDEX_SLEW_RPM			= 15	; Maximum mechanical homing speed
 
-; Motion-controller tuning. P, I, and D are in sixteenths: 4 means 0.25.
-; P and D act on encoder counts per 4.096 ms update. I acts on the final-only
-; error accumulator after its internal /32 scaling. FF retains its Q8 rate scale.
-.equ	INDEX_P_GAIN			= 24 ; 1.50 tracking-error stiffness
-.equ	INDEX_I_GAIN			= 8	; 0.50 final static-error correction
-.equ	INDEX_D_GAIN			= 8	; 0.50 measured-motion damping
-.equ	INDEX_I_MAX			= 8191	; Absolute final-error accumulator clamp
-.equ	INDEX_FF_GAIN			= 0	; Target-rate feed-forward
-.equ	INDEX_STUCK_DELTA		= 3	; Max |encoder delta| considered virtually stopped
+; Step-response position controller. P and I are in sixteenths: 4 means 0.25.
+; I accumulates on every update, resets when position error crosses zero, and is
+; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
+.equ	INDEX_P_GAIN			= 6
+.equ	INDEX_I_GAIN			= 3
+.equ	INDEX_I_MAX				= 16348
+.equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 3 degrees from home
+.equ	INDEX_CAL_NOISE_DELTA	= 3	; Electrical-calibration encoder-noise threshold
 
 ; Board-level electrical safety limits. Change these only after checking the
 ; gate waveform and phase current on the actual hardware. This is a hard ceiling
-; for breakaway discovery; normal calibration and homing use only the measured
-; breakaway duty plus a small internal margin.
-.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us low-side pulse / 16% at 20 kHz
+; for sparse calibration excitation. Homing uses the converted threshold in its
+; separate 20 kHz pulse-width range.
+.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse at 5 kHz effective / 4% average duty
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay around a six-step vector change
 
 ;*********************

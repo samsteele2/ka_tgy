@@ -250,31 +250,19 @@
 
 .if INDEX_ENABLE
 ; Index-mode implementation constants. The board file deliberately exposes
-; only enable/commissioning, delay, speed, and electrical safety settings.
+; only enable/commissioning, controller, and electrical safety settings.
 .equ	INDEX_CONTROL_PERIOD_US = 4096
 .equ	INDEX_DELAY_OVF = (INDEX_START_DELAY_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 .if (INDEX_START_DELAY_SECONDS < 1) || (INDEX_START_DELAY_SECONDS > 30)
 .error "INDEX_START_DELAY_SECONDS must be in the range 1..30"
 .endif
-.if (INDEX_SLEW_RPM < 1) || (INDEX_SLEW_RPM > 30)
-.error "INDEX_SLEW_RPM must be in the range 1..30"
-.endif
-; Q8 encoder counts per 4.096 ms, rounded. The reduced rational avoids a
-; 32-bit overflow while retaining the exact 4096-count/revolution conversion.
-.equ	INDEX_SLEW_STEP_Q8 = (INDEX_SLEW_RPM * 67108864 + 468750) / 937500
-.equ	INDEX_PROFILE_ACCEL_Q8 = 64	; 0.25 encoder count/update^2
-.equ	INDEX_PROFILE_TAPER_SHIFT = 3	; Allowed Q8 rate = distance * 8
-
-.equ	INDEX_POSITION_TOLERANCE = 4	; 0.352 mechanical degree
 .equ	INDEX_SETTLE_DELTA = 2		; Maximum motion on terminal release
 .equ	INDEX_TRACK_I_SHIFT = 5
 .equ	INDEX_DENSITY_MAX = 255
-.equ	INDEX_STUCK_SAMPLES = 16	; 65.536 ms of continuously low encoder motion
+.equ	INDEX_MINUTES_PER_REVOLUTION = 21600
+.equ	INDEX_HOME_DEADZONE_COUNTS = (INDEX_HOME_DEADZONE_MINUTES * 4096 + 10800) / INDEX_MINUTES_PER_REVOLUTION
 .if (INDEX_P_GAIN < 0) || (INDEX_P_GAIN > 255)
 .error "INDEX_P_GAIN must be in the range 0..255 (gain in sixteenths)"
-.endif
-.if (INDEX_D_GAIN < 0) || (INDEX_D_GAIN > 255)
-.error "INDEX_D_GAIN must be in the range 0..255 (gain in sixteenths)"
 .endif
 .if (INDEX_I_GAIN < 0) || (INDEX_I_GAIN > 255)
 .error "INDEX_I_GAIN must be in the range 0..255 (gain in sixteenths)"
@@ -282,11 +270,11 @@
 .if (INDEX_I_MAX < 1) || (INDEX_I_MAX > 16384)
 .error "INDEX_I_MAX must be in the range 1..16384"
 .endif
-.if (INDEX_FF_GAIN < 0) || (INDEX_FF_GAIN > 255)
-.error "INDEX_FF_GAIN must be in the range 0..255"
+.if (INDEX_HOME_DEADZONE_MINUTES < 0) || (INDEX_HOME_DEADZONE_MINUTES > 10800)
+.error "INDEX_HOME_DEADZONE_MINUTES must be in the range 0..10800"
 .endif
-.if (INDEX_STUCK_DELTA < 0) || (INDEX_STUCK_DELTA > 127)
-.error "INDEX_STUCK_DELTA must be in the range 0..127 encoder counts/update"
+.if (INDEX_CAL_NOISE_DELTA < 0) || (INDEX_CAL_NOISE_DELTA > 127)
+.error "INDEX_CAL_NOISE_DELTA must be in the range 0..127 encoder counts/update"
 .endif
 
 .equ	INDEX_AS5600_ADDR_W = 0x6c
@@ -294,16 +282,25 @@
 .equ	INDEX_AS5600_ANGLE_REG = 0x0e
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
 .equ	INDEX_HOME_MARKER = 0xa5
-.equ	INDEX_ELECTRICAL_MARKER = 0x5d	; Noise-qualified breakaway-threshold record
+.equ	INDEX_ELECTRICAL_MARKER = 0x5e	; Sparse-pulse calibration record
 
-.equ	INDEX_CAL_DUTY_MIN = MIN_DUTY
-.equ	INDEX_CAL_DUTY_STEP = 4
-.equ	INDEX_CAL_DUTY_MARGIN = 8
-.equ	INDEX_CAL_MOVE_COUNTS = INDEX_STUCK_DELTA * 2 + 1
+; Calibration emits one pulse per four 20 kHz frames. Doubling the individual
+; pulse width preserves Timer2 timing margin while halving average bridge duty
+; and reducing low-side switching events from 20 kHz to 5 kHz. Homing remains
+; on the 20 kHz pulse-density carrier with the original pulse-width range.
+.equ	INDEX_CAL_PULSE_DENSITY = 64
+.equ	INDEX_CAL_DUTY_SCALE = 2
+.equ	INDEX_HOME_DUTY_MIN = MIN_DUTY
+.equ	INDEX_HOME_DUTY_MARGIN = 8
+.equ	INDEX_HOME_DUTY_MAX = INDEX_CAL_DUTY_MAX / INDEX_CAL_DUTY_SCALE
+.equ	INDEX_CAL_DUTY_MIN = MIN_DUTY * INDEX_CAL_DUTY_SCALE
+.equ	INDEX_CAL_DUTY_STEP = 4 * INDEX_CAL_DUTY_SCALE
+.equ	INDEX_CAL_DUTY_MARGIN = 8 * INDEX_CAL_DUTY_SCALE
+.equ	INDEX_CAL_MOVE_COUNTS = INDEX_CAL_NOISE_DELTA * 2 + 1
 .equ	INDEX_CAL_MOVE_SAMPLES = 4	; Sustained displacement, not one noise excursion
 .equ	INDEX_CAL_RAMP_STEP_TICKS = 12
-.equ	INDEX_CAL_SETTLE_DELTA = INDEX_STUCK_DELTA
-.equ	INDEX_CAL_SETTLE_WINDOW = INDEX_STUCK_DELTA * 2
+.equ	INDEX_CAL_SETTLE_DELTA = INDEX_CAL_NOISE_DELTA
+.equ	INDEX_CAL_SETTLE_WINDOW = INDEX_CAL_NOISE_DELTA * 2
 .equ	INDEX_CAL_SETTLE_SAMPLES = 64	; 262.144 ms continuously stable
 .equ	INDEX_CAL_SETTLE_TIMEOUT_TICKS = 733	; 3.002 s maximum per hold
 .equ	INDEX_CAL_SWEEP_STEP = 8
@@ -329,6 +326,9 @@
 .endif
 .if INDEX_CAL_DUTY_MAX < INDEX_CAL_DUTY_MIN
 .error "Index calibration duty ceiling must not be below its starting duty"
+.endif
+.if (INDEX_CAL_DUTY_MAX % INDEX_CAL_DUTY_SCALE) || (INDEX_HOME_DUTY_MAX < INDEX_HOME_DUTY_MIN)
+.error "Index calibration ceiling must yield a valid homing pulse width"
 .endif
 .equ	INDEX_DEADTIME_CYCLES = (F_CPU / 1000000) * INDEX_DEADTIME_US
 .equ	INDEX_DEADTIME_LOOPS = (INDEX_DEADTIME_CYCLES + 1) / 3
@@ -510,13 +510,6 @@ index_wait_l:	.byte	1	; 4.096 ms Timer1-overflow ticks since throttle went low
 index_wait_h:	.byte	1
 index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
 index_angle_h:	.byte	1
-index_target_frac: .byte 1	; Q8 fractional part of the 15 RPM position target
-index_target_l:	.byte	1	; Slew-limited mechanical target, 0..4095
-index_target_h:	.byte	1
-index_target_rate_l: .byte 1 ; Signed Q8 target velocity (encoder counts/update)
-index_target_rate_h: .byte 1
-index_error_l:	.byte	1	; Signed wrapped target-minus-measured error
-index_error_h:	.byte	1
 index_electrical_l: .byte 1	; Rotor electrical angle, 0..4095
 index_electrical_h: .byte 1
 index_voltage_l: .byte 1	; Requested q-axis voltage-vector angle, 0..4095
@@ -526,13 +519,12 @@ index_vector_sector: .byte 1	; Nearest six-step active vector, 0..5
 index_pwm_vector: .byte 1	; Energized vector 0..5, or 0xff when off
 index_pwm_density: .byte 1	; Requested pulse density, 0..255
 index_pwm_accumulator: .byte 1 ; First-order deterministic density accumulator
-index_previous_angle_l: .byte 1 ; Previous AS5600 angle for D damping
+index_previous_angle_l: .byte 1 ; Previous AS5600 angle for terminal motion test
 index_previous_angle_h: .byte 1
-index_stuck_ticks: .byte 1	; Consecutive samples with exactly zero rotor motion
-index_integral_l: .byte 1	; Signed final-approach position-error integral
+index_previous_error_l: .byte 1 ; Previous signed home error for zero-cross reset
+index_previous_error_h: .byte 1
+index_integral_l: .byte 1	; Signed continuously active position-error integral
 index_integral_h: .byte 1
-index_pid_d_l: .byte 1	; Temporary signed derivative command for PID update
-index_pid_d_h: .byte 1
 index_cal_state: .byte 1	; Automatic electrical-calibration phase
 index_cal_ticks_l: .byte 1	; Service ticks within the current phase
 index_cal_ticks_h: .byte 1
@@ -3514,12 +3506,12 @@ index_electrical_is_valid:
 		brsh	index_electrical_invalid
 		lds	temp1, index_pwm_duty_l
 		lds	temp2, index_pwm_duty_h
-		cpi	temp1, low(INDEX_CAL_DUTY_MIN)
-		ldi	temp3, high(INDEX_CAL_DUTY_MIN)
+		cpi	temp1, low(INDEX_HOME_DUTY_MIN)
+		ldi	temp3, high(INDEX_HOME_DUTY_MIN)
 		cpc	temp2, temp3
 		brcs	index_electrical_invalid
-		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
-		ldi	temp3, high(INDEX_CAL_DUTY_MAX + 1)
+		cpi	temp1, low(INDEX_HOME_DUTY_MAX + 1)
+		ldi	temp3, high(INDEX_HOME_DUTY_MAX + 1)
 		cpc	temp2, temp3
 		brcc	index_electrical_invalid
 		lds	temp1, index_breakaway_density
@@ -3608,17 +3600,20 @@ index_home_begin:
 		sts	index_state, temp1
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
-		sts	index_target_l, temp1
-		sts	index_target_h, temp2
-		sts	index_target_frac, ZH
-		sts	index_target_rate_l, ZH
-		sts	index_target_rate_h, ZH
 		sts	index_previous_angle_l, temp1
 		sts	index_previous_angle_h, temp2
+		lds	temp3, index_home_l
+		lds	temp4, index_home_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrc	temp4, 3
+		ori	temp4, 0xf0
+		sts	index_previous_error_l, temp3
+		sts	index_previous_error_h, temp4
 		sts	index_pwm_density, ZH
 		sts	index_pwm_accumulator, ZH
 		sts	index_q_command, ZH
-		sts	index_stuck_ticks, ZH
 		sts	index_integral_l, ZH
 		sts	index_integral_h, ZH
 		sbr	flags2, (1<<INDEX_DENSITY_PWM)
@@ -3671,132 +3666,21 @@ index_service:
 		.endif
 		ret
 
-	; Build an acceleration-limited Q8 motion profile toward home. Far from home
-	; the rate reaches INDEX_SLEW_RPM; inside roughly 12 degrees it tapers in
-	; proportion to distance. This removes the instantaneous start/stop in the
-	; old fixed-step target and also supplies a velocity feed-forward reference.
+	; Direct step command to mechanical home. There is no target trajectory, speed
+	; limiter, feed-forward term, or position-control breakaway substitution.
 index_position_step:
-		lds	temp3, index_target_l
-		lds	temp4, index_target_h
-		lds	temp1, index_home_l
-		lds	temp2, index_home_h
-		sub	temp1, temp3
-		sbc	temp2, temp4
-		andi	temp2, 0x0f		; Wrap difference modulo one mechanical turn
-		sbrc	temp2, 3
-		ori	temp2, 0xf0		; Sign-extend the 12-bit negative difference
-		movw	YL, temp1
-		clr	XL			; XL = desired-rate sign flag
-		sbrs	YH, 7
-		rjmp	index_profile_magnitude
-		inc	XL
-		com	YH
-		neg	YL
-		sbci	YH, 0xff
-index_profile_magnitude:
-		; One remaining integer count is below the profile's useful resolution.
-		; Snap the internal target; rotor position still has its own settle test.
-		tst	YH
-		brne	index_profile_rate_limit
-		cpi	YL, 2
-		brsh	index_profile_rate_limit
-		rjmp	index_profile_home
-index_profile_rate_limit:
-		movw	temp1, YL
-		ldi	temp3, INDEX_PROFILE_TAPER_SHIFT
-index_profile_taper_loop:
-		lsl	temp1
-		rol	temp2
-		dec	temp3
-		brne	index_profile_taper_loop
-		cpi	temp1, low(INDEX_SLEW_STEP_Q8)
-		ldi	temp3, high(INDEX_SLEW_STEP_Q8)
-		cpc	temp2, temp3
-		brlo	index_profile_rate_sign
-		ldi2	temp1, temp2, INDEX_SLEW_STEP_Q8
-index_profile_rate_sign:
-		tst	XL
-		breq	index_profile_rate_desired
-		com	temp2
-		neg	temp1
-		sbci	temp2, 0xff
-index_profile_rate_desired:
-		movw	YL, temp1		; Y = signed desired Q8 rate
-
-		; Slew the target rate by at most 0.25 count/update each service.
-		lds	temp3, index_target_rate_l
-		lds	temp4, index_target_rate_h
-		movw	XL, YL
-		sub	XL, temp3
-		sbc	XH, temp4		; X = desired - current
-		sbrc	XH, 7
-		rjmp	index_profile_rate_decrease
-		cpi	XL, low(INDEX_PROFILE_ACCEL_Q8)
-		ldi	temp1, high(INDEX_PROFILE_ACCEL_Q8)
-		cpc	XH, temp1
-		brlo	index_profile_rate_store
-		breq	index_profile_rate_store
-		movw	YL, temp3
-		subi	YL, low(-INDEX_PROFILE_ACCEL_Q8)
-		sbci	YH, high(-INDEX_PROFILE_ACCEL_Q8)
-		rjmp	index_profile_rate_store
-index_profile_rate_decrease:
-		com	XH
-		neg	XL
-		sbci	XH, 0xff
-		cpi	XL, low(INDEX_PROFILE_ACCEL_Q8)
-		ldi	temp1, high(INDEX_PROFILE_ACCEL_Q8)
-		cpc	XH, temp1
-		brlo	index_profile_rate_store
-		breq	index_profile_rate_store
-		movw	YL, temp3
-		subi	YL, low(INDEX_PROFILE_ACCEL_Q8)
-		sbci	YH, high(INDEX_PROFILE_ACCEL_Q8)
-index_profile_rate_store:
-		sts	index_target_rate_l, YL
-		sts	index_target_rate_h, YH
-
-		; Add the signed Q8 rate to the 12-bit circular target.
-		lds	temp1, index_target_frac
-		add	temp1, YL
-		sts	index_target_frac, temp1
-		lds	temp3, index_target_l
-		lds	temp4, index_target_h
-		adc	temp3, YH
-		clr	temp2
-		sbrc	YH, 7
-		ldi	temp2, 0xff
-		adc	temp4, temp2
-		andi	temp4, 0x0f
-		rjmp	index_slew_store
-
-index_profile_home:
 		lds	temp3, index_home_l
 		lds	temp4, index_home_h
-		sts	index_target_frac, ZH
-		sts	index_target_rate_l, ZH
-		sts	index_target_rate_h, ZH
-index_slew_store:
-		sts	index_target_l, temp3
-		sts	index_target_h, temp4
-
-	; Signed shortest target-minus-measured position error.
-		lds	temp3, index_target_l
-		lds	temp4, index_target_h
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sub	temp3, temp1
 		sbc	temp4, temp2
-		andi	temp4, 0x0f
+		andi	temp4, 0x0f		; Wrap modulo one mechanical revolution
 		sbrc	temp4, 3
-		ori	temp4, 0xf0
-		sts	index_error_l, temp3
-		sts	index_error_h, temp4
-		movw	XL, temp3		; Preserve the signed current error
+		ori	temp4, 0xf0		; Sign-extend the 12-bit difference
+		movw	XL, temp3		; X = signed home-minus-position error
 
-	; Measure signed rotor motion independently from the moving target. Taking
-	; D from the encoder avoids a forward derivative kick each time the 15 RPM
-	; slew target advances.
+	; Raw signed rotor delta is used only for the terminal low-motion test.
 		lds	temp3, index_angle_l
 		lds	temp4, index_angle_h
 		lds	temp1, index_previous_angle_l
@@ -3809,369 +3693,200 @@ index_slew_store:
 		sbrc	temp4, 3
 		ori	temp4, 0xf0
 
-	; Static breakaway torque is appropriate only after the encoder has reported
-	; continuously low movement for a sustained interval. Compare the absolute
-	; delta against the configurable noise threshold without modifying the signed
-	; delta used by the D term and terminal velocity check below.
-		movw	temp1, temp3
-		sbrs	temp2, 7
-		rjmp	index_motion_absolute
-		com	temp2
-		neg	temp1
-		sbci	temp2, 0xff
-index_motion_absolute:
-		tst	temp2
-		brne	index_motion_detected
-		cpi	temp1, INDEX_STUCK_DELTA + 1
-		brlo	index_motion_stationary
-index_motion_detected:
-		sts	index_stuck_ticks, ZH
-		rjmp	index_motion_state_ready
-index_motion_stationary:
-		lds	temp1, index_stuck_ticks
-		cpi	temp1, INDEX_STUCK_SAMPLES
-		brsh	index_motion_state_ready
-		inc	temp1
-		sts	index_stuck_ticks, temp1
-index_motion_state_ready:
-
-	; Once the slew target and measured rotor are both at home, release every
-	; FET and latch completion. Require low measured motion as well as position.
+	; Release the bridge when position is inside the configured angular deadzone
+	; and instantaneous raw motion is small. Completion is terminal for this cycle.
 		movw	temp1, XL
 		sbrs	temp2, 7
-		rjmp	index_pd_position_absolute
+		rjmp	index_pi_position_absolute
 		com	temp2
 		neg	temp1
 		sbci	temp2, 0xff
-index_pd_position_absolute:
-		tst	temp2
-		brne	index_pd_continue
-		cpi	temp1, INDEX_POSITION_TOLERANCE + 1
-		brsh	index_pd_continue
-		lds	temp1, index_target_l
-		lds	temp2, index_target_h
-		lds	YL, index_home_l
-		lds	YH, index_home_h
-		cp	temp1, YL
-		cpc	temp2, YH
-		brne	index_pd_continue
+index_pi_position_absolute:
+		cpi	temp1, low(INDEX_HOME_DEADZONE_COUNTS + 1)
+		ldi	YL, high(INDEX_HOME_DEADZONE_COUNTS + 1)
+		cpc	temp2, YL
+		brsh	index_pi_continue
 		movw	temp1, temp3
 		sbrs	temp2, 7
-		rjmp	index_pd_velocity_absolute
+		rjmp	index_pi_velocity_absolute
 		com	temp2
 		neg	temp1
 		sbci	temp2, 0xff
-index_pd_velocity_absolute:
+index_pi_velocity_absolute:
 		tst	temp2
-		brne	index_pd_continue
+		brne	index_pi_continue
 		cpi	temp1, INDEX_SETTLE_DELTA + 1
-		brsh	index_pd_continue
+		brsh	index_pi_continue
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rcall	index_home_complete
 		ret
 
-	; Tracking command: u = FF*target_rate + P*error
-	;                         - D*measured_rotor_delta
-	;                         + I*(integral / 2^I_SHIFT).
-	; Rate feed-forward supplies torque as the target accelerates instead of
-	; waiting for a large lag error and then releasing a burst of pulses.
-	; The derivative acts only as damping. Accumulate position error only after
-	; the slew target has reached home, so the I term corrects static final-position
-	; load without winding up during the commanded 15 RPM move. Clear it whenever
-	; error crosses zero and clamp it to a bounded final-approach contribution.
-index_pd_continue:
-		movw	YL, temp3		; Preserve signed measured rotor movement
-		lds	temp1, index_target_l
-		lds	temp2, index_target_h
-		lds	temp3, index_home_l
-		lds	temp4, index_home_h
-		cp	temp1, temp3
-		cpc	temp2, temp4
-		breq	index_pid_integrate
+index_pi_continue:
+	; Clear stored integral whenever the signed error crosses zero. Exact zero also
+	; clears it, preventing residual torque while the rotor passes through home.
+		lds	temp1, index_previous_error_l
+		lds	temp2, index_previous_error_h
+		mov	temp3, XL
+		or	temp3, XH
+		breq	index_pi_integral_reset
+		mov	temp3, temp1
+		or	temp3, temp2
+		breq	index_pi_integral_no_crossing
+		mov	temp3, temp2
+		eor	temp3, XH
+		sbrs	temp3, 7
+		rjmp	index_pi_integral_no_crossing
+index_pi_integral_reset:
 		sts	index_integral_l, ZH
 		sts	index_integral_h, ZH
-		rjmp	index_pid_integral_ready
+index_pi_integral_no_crossing:
+		sts	index_previous_error_l, XL
+		sts	index_previous_error_h, XH
 
-index_pid_integrate:
+	; Integral action remains active on every update between zero crossings. The
+	; symmetric INDEX_I_MAX clamp is its magnitude limit.
 		lds	temp1, index_integral_l
 		lds	temp2, index_integral_h
-		mov	temp3, temp2
-		eor	temp3, XH		; Opposite signs mean the error crossed zero
-		sbrs	temp3, 7
-		rjmp	index_pid_integral_add
-		clr	temp1
-		clr	temp2
-index_pid_integral_add:
 		add	temp1, XL
 		adc	temp2, XH
 		sbrc	temp2, 7
-		rjmp	index_pid_integral_negative
+		rjmp	index_pi_integral_negative
 		cpi	temp1, low(INDEX_I_MAX)
 		ldi	temp3, high(INDEX_I_MAX)
 		cpc	temp2, temp3
-		brlo	index_pid_integral_store
+		brlo	index_pi_integral_store
 		ldi	temp1, low(INDEX_I_MAX)
 		ldi	temp2, high(INDEX_I_MAX)
-		rjmp	index_pid_integral_store
-index_pid_integral_negative:
+		rjmp	index_pi_integral_store
+index_pi_integral_negative:
 		cpi	temp1, low(-INDEX_I_MAX)
 		ldi	temp3, high(-INDEX_I_MAX)
 		cpc	temp2, temp3
-		brsh	index_pid_integral_store
+		brsh	index_pi_integral_store
 		ldi	temp1, low(-INDEX_I_MAX)
 		ldi	temp2, high(-INDEX_I_MAX)
-index_pid_integral_store:
+index_pi_integral_store:
 		sts	index_integral_l, temp1
 		sts	index_integral_h, temp2
-index_pid_integral_ready:
-		movw	temp1, YL		; D = D_GAIN * measured rotor movement
-		ldi	temp3, INDEX_D_GAIN
-		rcall	index_pid_signed_scale_q4
-		sts	index_pid_d_l, temp1
-		sts	index_pid_d_h, temp2
 
-		movw	temp1, XL		; P = P_GAIN * position error
+	; Proportional command. The shared scaler provides signed saturation.
+		movw	temp1, XL
 		ldi	temp3, INDEX_P_GAIN
-		rcall	index_pid_signed_scale_q4
-		lds	temp3, index_pid_d_l
-		lds	temp4, index_pid_d_h
-		mov	YL, temp2		; Preserve P sign for saturating P-D
-		sub	temp1, temp3
-		sbc	temp2, temp4
-		mov	temp3, YL
-		eor	temp3, temp4		; Overflow only when P and D signs differ
-		sbrs	temp3, 7
-		rjmp	index_pid_pd_no_overflow
-		mov	temp3, YL
-		eor	temp3, temp2
-		sbrs	temp3, 7
-		rjmp	index_pid_pd_no_overflow
-		sbrs	YL, 7
-		rjmp	index_pid_pd_positive
-		clr	temp1
-		ldi	temp2, 0x80
-		rjmp	index_pid_pd_no_overflow
-index_pid_pd_positive:
-		ldi	temp1, 0xff
-		ldi	temp2, 0x7f
-index_pid_pd_no_overflow:
-		push	temp1			; Preserve P-D while feed-forward is scaled
-		push	temp2
-		rcall	index_pid_feedforward
-		movw	temp3, temp1
-		pop	temp2
-		pop	temp1
-		movw	XL, temp1		; Add signed target-rate feed-forward
-		movw	temp1, temp3
-		mov	YL, XH
-		add	XL, temp1
-		adc	XH, temp2
-		mov	temp3, YL
-		eor	temp3, temp2
-		sbrs	temp3, 7
-		rjmp	index_pid_ff_same_sign
-		rjmp	index_pid_ff_done
-index_pid_ff_same_sign:
-		mov	temp3, YL
-		eor	temp3, XH
-		sbrs	temp3, 7
-		rjmp	index_pid_ff_done
-		sbrs	YL, 7
-		rjmp	index_pid_ff_positive
-		clr	XL
-		ldi	XH, 0x80
-		rjmp	index_pid_ff_done
-index_pid_ff_positive:
-		ldi	XL, 0xff
-		ldi	XH, 0x7f
-index_pid_ff_done:
+		rcall	index_pi_signed_scale_q4
+		movw	XL, temp1
+
+	; Add the continuously accumulated I term with signed saturation.
 		lds	temp1, index_integral_l
 		lds	temp2, index_integral_h
 		ldi	YL, INDEX_TRACK_I_SHIFT
-index_pid_integral_scale:
+index_pi_integral_scale:
 		asr	temp2
 		ror	temp1
 		dec	YL
-		brne	index_pid_integral_scale
+		brne	index_pi_integral_scale
 		ldi	temp3, INDEX_I_GAIN
-		rcall	index_pid_signed_scale_q4
-		mov	YL, XH		; Preserve P-D sign for saturating sum
+		rcall	index_pi_signed_scale_q4
+		mov	YL, XH			; Preserve P sign
 		add	XL, temp1
 		adc	XH, temp2
 		mov	temp3, YL
 		eor	temp3, temp2		; Opposite-signed inputs cannot overflow
 		sbrs	temp3, 7
-		rjmp	index_pid_sum_same_sign
-		rjmp	index_pid_sum_done
-index_pid_sum_same_sign:
+		rjmp	index_pi_sum_same_sign
+		rjmp	index_pi_sum_done
+index_pi_sum_same_sign:
 		mov	temp3, YL
 		eor	temp3, XH
 		sbrs	temp3, 7
-		rjmp	index_pid_sum_done
+		rjmp	index_pi_sum_done
 		sbrs	YL, 7
-		rjmp	index_pid_sum_positive
+		rjmp	index_pi_sum_positive
 		clr	XL
 		ldi	XH, 0x80
-		rjmp	index_pid_sum_done
-index_pid_sum_positive:
+		rjmp	index_pi_sum_done
+index_pi_sum_positive:
 		ldi	XL, 0xff
 		ldi	XH, 0x7f
-index_pid_sum_done:
+index_pi_sum_done:
 		movw	temp3, XL
 
-	; Cap the continuous moving command at 255 density counts. Do not apply the
-	; static-friction offset while the encoder reports motion: doing so creates a
-	; discontinuous torque reversal and a hard limit cycle around home. Only after
-	; INDEX_STUCK_SAMPLES consecutive low-motion updates raise a smaller command
-	; to the calibrated breakaway density. Motion above INDEX_STUCK_DELTA clears it.
+	; Convert the continuous signed PI result directly to pulse density. There is
+	; no learned minimum, stall timer, dead-zone inversion, or breakaway pulse.
 		clr	YL			; YL = command sign flag
 		sbrs	temp4, 7
-		rjmp	index_pd_magnitude
+		rjmp	index_pi_magnitude
 		inc	YL
 		com	temp4
 		neg	temp3
 		sbci	temp4, 0xff
-index_pd_magnitude:
+index_pi_magnitude:
 		mov	temp1, temp3
 		or	temp1, temp4
-		breq	index_pd_zero
+		breq	index_pi_zero
 		tst	temp4
-		brne	index_pd_density_capped
+		brne	index_pi_density_capped
 		mov	temp1, temp3
 		cpi	temp1, INDEX_DENSITY_MAX
-		brlo	index_pd_density_store
-		breq	index_pd_density_store
-		rjmp	index_pd_density_capped
-index_pd_density_capped:
+		brlo	index_pi_density_store
+		breq	index_pi_density_store
+index_pi_density_capped:
 		ldi	temp1, INDEX_DENSITY_MAX
-		rjmp	index_pd_density_store
-index_pd_density_store:
-		lds	temp2, index_stuck_ticks
-		cpi	temp2, INDEX_STUCK_SAMPLES
-		brlo	index_pd_density_continuous
-		lds	temp2, index_breakaway_density
-		cp	temp1, temp2
-		brsh	index_pd_density_continuous
-		mov	temp1, temp2
-index_pd_density_continuous:
+index_pi_density_store:
 		sts	index_pwm_density, temp1
-
 		ldi	temp3, 1
 		tst	YL
-		breq	index_pd_encoder_direction
+		breq	index_pi_encoder_direction
 		neg	temp3
-index_pd_encoder_direction:
-		; Vector order is the calibration field direction. If increasing vectors
-		; made raw encoder counts fall, invert the raw tracking-command direction.
+index_pi_encoder_direction:
 		lds	temp1, index_encoder_reverse
 		tst	temp1
-		breq	index_pd_store
+		breq	index_pi_store
 		neg	temp3
-index_pd_store:
+index_pi_store:
 		sts	index_q_command, temp3
 		rjmp	index_position_electrical
 
-index_pd_zero:
-		; A zero fixed-point PID result must not erase measured stall history. If
-		; low motion has persisted and position error is outside the terminal
-		; tolerance, command the learned breakaway density in the error direction.
-		lds	temp2, index_stuck_ticks
-		cpi	temp2, INDEX_STUCK_SAMPLES
-		brlo	index_pd_coast
-		lds	temp3, index_error_l
-		lds	temp4, index_error_h
-		clr	YL
-		sbrs	temp4, 7
-		rjmp	index_pd_zero_error_absolute
-		inc	YL
-		com	temp4
-		neg	temp3
-		sbci	temp4, 0xff
-index_pd_zero_error_absolute:
-		tst	temp4
-		brne	index_pd_zero_breakaway
-		cpi	temp3, INDEX_POSITION_TOLERANCE + 1
-		brlo	index_pd_coast
-index_pd_zero_breakaway:
-		lds	temp1, index_breakaway_density
-		rjmp	index_pd_density_continuous
-index_pd_coast:
+index_pi_zero:
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rjmp	index_position_electrical
 
-	; Convert signed Q8 target rate to pulse-density command using the user-facing
-	; integer FF gain: command = target_rate_q8 * INDEX_FF_GAIN / 256.
-index_pid_feedforward:
-		lds	YL, index_target_rate_l
-		lds	YH, index_target_rate_h
-		clr	XL			; XL = input sign flag
-		sbrs	YH, 7
-		rjmp	index_pid_ff_absolute
-		inc	XL
-		com	YH
-		neg	YL
-		sbci	YH, 0xff
-index_pid_ff_absolute:
-		clr	temp1			; temp3:temp2:temp1 = unsigned product
-		clr	temp2
-		clr	temp3
-		ldi	temp4, INDEX_FF_GAIN
-index_pid_ff_multiply:
-		tst	temp4
-		breq	index_pid_ff_scaled
-		add	temp1, YL
-		adc	temp2, YH
-		adc	temp3, ZH
-		dec	temp4
-		rjmp	index_pid_ff_multiply
-index_pid_ff_scaled:
-		mov	temp1, temp2		; Discard the eight Q8 fractional bits
-		mov	temp2, temp3
-		tst	XL
-		breq	index_pid_ff_ret
-		com	temp2
-		neg	temp1
-		sbci	temp2, 0xff
-index_pid_ff_ret:
-		ret
-
 	; Input: temp2:temp1 signed command, temp3 unsigned gain in sixteenth-steps.
 	; Output: temp2:temp1 = saturate(command * gain / 16). Saturation keeps
 	; aggressive tuning from wrapping the command into reverse torque.
-index_pid_signed_scale_q4:
+index_pi_signed_scale_q4:
 		mov	temp4, temp3		; Low nibble = fractional sixteenth remainder
 		andi	temp4, 15
 		swap	temp3
 		andi	temp3, 15		; temp3 = integer gain portion, 0..15
 		sbrs	temp2, 7
-		rjmp	index_pid_scale_absolute
+		rjmp	index_pi_scale_absolute
 		com	temp2
 		neg	temp1
 		sbci	temp2, 0xff
 		ori	temp4, 0x80		; Remember negative input in the sign bit
-index_pid_scale_absolute:
+index_pi_scale_absolute:
 		movw	YL, temp1		; Y = positive addend
 		clr	temp1			; temp = unsigned scaled magnitude
 		clr	temp2
 		sbrs	temp4, 7
-		rjmp	index_pid_scale_fraction_positive
-index_pid_scale_fraction_negative:
+		rjmp	index_pi_scale_fraction_positive
+index_pi_scale_fraction_negative:
 		cpi	temp4, 0x80
-		breq	index_pid_scale_fraction_done
+		breq	index_pi_scale_fraction_done
 		add	temp1, YL
 		adc	temp2, YH
 		dec	temp4
-		rjmp	index_pid_scale_fraction_negative
-index_pid_scale_fraction_positive:
+		rjmp	index_pi_scale_fraction_negative
+index_pi_scale_fraction_positive:
 		tst	temp4
-		breq	index_pid_scale_fraction_done
+		breq	index_pi_scale_fraction_done
 		add	temp1, YL
 		adc	temp2, YH
 		dec	temp4
-		rjmp	index_pid_scale_fraction_positive
-index_pid_scale_fraction_done:
+		rjmp	index_pi_scale_fraction_positive
+index_pi_scale_fraction_done:
 		lsr	temp2			; Fractional contribution = remainder * input / 16
 		ror	temp1
 		lsr	temp2
@@ -4180,26 +3895,26 @@ index_pid_scale_fraction_done:
 		ror	temp1
 		lsr	temp2
 		ror	temp1
-index_pid_scale_loop:
+index_pi_scale_loop:
 		tst	temp3
-		breq	index_pid_scale_sign
+		breq	index_pi_scale_sign
 		add	temp1, YL
 		adc	temp2, YH
 		sbrs	temp2, 7
-		rjmp	index_pid_scale_next
+		rjmp	index_pi_scale_next
 		ldi	temp1, 0xff
 		ldi	temp2, 0x7f
-		rjmp	index_pid_scale_sign
-index_pid_scale_next:
+		rjmp	index_pi_scale_sign
+index_pi_scale_next:
 		dec	temp3
-		rjmp	index_pid_scale_loop
-index_pid_scale_sign:
+		rjmp	index_pi_scale_loop
+index_pi_scale_sign:
 		sbrs	temp4, 7
-		rjmp	index_pid_scale_ret
+		rjmp	index_pi_scale_ret
 		com	temp2
 		neg	temp1
 		sbci	temp2, 0xff
-index_pid_scale_ret:
+index_pi_scale_ret:
 		ret
 
 	; Convert mechanical encoder angle using the automatically calibrated
@@ -4300,7 +4015,8 @@ index_sector_rounded:
 index_home_complete:
 		rcall	switch_power_off
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
-		sts	index_stuck_ticks, ZH
+		sts	index_previous_error_l, ZH
+		sts	index_previous_error_h, ZH
 		sts	index_integral_l, ZH
 		sts	index_integral_h, ZH
 		lds	temp1, index_state
@@ -4318,7 +4034,10 @@ index_home_complete:
 	; or anti-aligned rotor cannot hide at a zero-torque point. Once motion proves
 	; the raw threshold, all later calibration drive is capped at threshold+margin.
 index_calibration_start:
-		cbr	flags2, (1<<INDEX_DENSITY_PWM)
+		sbr	flags2, (1<<INDEX_DENSITY_PWM)
+		ldi	temp1, INDEX_CAL_PULSE_DENSITY
+		sts	index_pwm_density, temp1
+		sts	index_pwm_accumulator, ZH
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)|(1<<INDEX_CALIBRATING)
@@ -4378,35 +4097,30 @@ index_calibration_delta:
 		ori	temp4, 0xf0
 		ret
 
-	; Convert raw breakaway duty to its equivalent density at the bounded
-	; operating pulse width:
-	;     B = ceil(raw_breakaway * 256 / operating_duty).
-	; Both quantities were measured on this motor; the configured ceiling is only
-	; a hard abort limit and is not used as the normal calibration/homing drive.
+	; Convert the sparse calibration threshold to equivalent homing density:
+	;     B = ceil(raw_calibration_pulse * calibration_density / home_pulse).
+	; This value remains in the EEPROM record for compatibility and diagnostics;
+	; the simplified position controller does not inject breakaway compensation.
 index_calibration_store_breakaway:
 		lds	YL, index_cal_duty_l
 		lds	YH, index_cal_duty_h
 		lds	temp1, index_pwm_duty_l
 		lds	temp2, index_pwm_duty_h
-		cp	YL, temp1
-		cpc	YH, temp2
-		brne	index_calibration_breakaway_divide_start
-		ldi	temp4, 255		; Density 255 is the all-frames special case
-		rjmp	index_calibration_breakaway_divide_exact
-index_calibration_breakaway_divide_start:
 		clr	XL			; Division remainder
 		clr	XH
 		clr	temp4			; Quotient B
-		clr	temp3			; Decrementing zero runs exactly 256 iterations
+		ldi	temp3, INDEX_CAL_PULSE_DENSITY
 index_calibration_breakaway_divide:
 		add	XL, YL
 		adc	XH, YH
+index_calibration_breakaway_subtract:
 		cp	XL, temp1
 		cpc	XH, temp2
 		brlo	index_calibration_breakaway_divide_next
 		sub	XL, temp1
 		sbc	XH, temp2
 		inc	temp4
+		rjmp	index_calibration_breakaway_subtract
 index_calibration_breakaway_divide_next:
 		dec	temp3
 		brne	index_calibration_breakaway_divide
@@ -4632,10 +4346,9 @@ index_calibration_breakaway_candidate:
 index_calibration_breakaway_found:
 		lds	temp1, index_cal_duty_l
 		lds	temp2, index_cal_duty_h
-		; Preserve the raw threshold. The operating/calibration pulse receives only
-		; the fixed bounded margin, never the configured ceiling by default.
-		push	temp1
-		push	temp2
+		; Calibration continues at the sparse threshold plus its scaled margin.
+		; Preserve that pulse on the stack while deriving the separate 20 kHz
+		; homing pulse width from the average calibration excitation.
 		subi	temp1, low(-INDEX_CAL_DUTY_MARGIN)
 		sbci	temp2, high(-INDEX_CAL_DUTY_MARGIN)
 		cpi	temp1, low(INDEX_CAL_DUTY_MAX + 1)
@@ -4644,15 +4357,39 @@ index_calibration_breakaway_found:
 		brlo	index_calibration_breakaway_store
 		ldi2	temp1, temp2, INDEX_CAL_DUTY_MAX
 index_calibration_breakaway_store:
+		push	temp1
+		push	temp2
+
+		; Density 64 is one quarter of the carrier. Round the raw sparse pulse
+		; upward to its continuous-width equivalent, then add the original homing
+		; margin and clamp to the Timer2-safe homing range.
+		lds	temp1, index_cal_duty_l
+		lds	temp2, index_cal_duty_h
+		subi	temp1, low(-3)
+		sbci	temp2, high(-3)
+		lsr	temp2
+		ror	temp1
+		lsr	temp2
+		ror	temp1
+		subi	temp1, low(-INDEX_HOME_DUTY_MARGIN)
+		sbci	temp2, high(-INDEX_HOME_DUTY_MARGIN)
+		cpi	temp1, low(INDEX_HOME_DUTY_MIN)
+		ldi	temp3, high(INDEX_HOME_DUTY_MIN)
+		cpc	temp2, temp3
+		brcc	index_calibration_home_min_valid
+		ldi2	temp1, temp2, INDEX_HOME_DUTY_MIN
+index_calibration_home_min_valid:
+		cpi	temp1, low(INDEX_HOME_DUTY_MAX + 1)
+		ldi	temp3, high(INDEX_HOME_DUTY_MAX + 1)
+		cpc	temp2, temp3
+		brlo	index_calibration_home_store
+		ldi2	temp1, temp2, INDEX_HOME_DUTY_MAX
+index_calibration_home_store:
 		sts	index_pwm_duty_l, temp1
 		sts	index_pwm_duty_h, temp2
+		rcall	index_calibration_store_breakaway
 		pop	temp2
 		pop	temp1
-		sts	index_cal_duty_l, temp1	; Raw breakaway threshold for conversion
-		sts	index_cal_duty_h, temp2
-		rcall	index_calibration_store_breakaway
-		lds	temp1, index_pwm_duty_l
-		lds	temp2, index_pwm_duty_h
 		sts	index_cal_duty_l, temp1
 		sts	index_cal_duty_h, temp2
 		sts	index_cal_field_l, ZH
@@ -4987,6 +4724,7 @@ index_calibration_commit_read_ok:
 		rjmp	index_home_begin
 
 index_calibration_failed:
+		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
 		sts	index_state, temp1
@@ -5097,10 +4835,9 @@ index_as5600_error:
 		sec
 		ret
 
-	; Homing uses only the measured breakaway duty plus the fixed calibration
-	; margin. Pulse density is mapped through the measured static-torque dead zone;
-	; INDEX_CAL_DUTY_MAX remains an abort ceiling, not normal operating power.
-	; Zero command always coasts; there is no braking interval.
+	; Homing uses the calibrated operating pulse width. The continuous PI result
+	; directly sets pulse density; calibration breakaway data is not substituted
+	; into position control. Zero command coasts with no braking interval.
 index_six_step_update:
 		lds	temp1, index_q_command
 		tst	temp1
@@ -5136,6 +4873,9 @@ index_six_step_drive:
 		brlo	index_six_step_vector_valid
 		rjmp	index_six_step_invalid
 index_six_step_vector_valid:
+		lds	temp4, index_state
+		sbrs	temp4, INDEX_CALIBRATING
+		rjmp	index_six_step_home_duty
 		cpi	temp2, low(INDEX_CAL_DUTY_MIN)
 		ldi	temp4, high(INDEX_CAL_DUTY_MIN)
 		cpc	temp3, temp4
@@ -5144,6 +4884,18 @@ index_six_step_vector_valid:
 index_six_step_duty_min_valid:
 		cpi	temp2, low(INDEX_CAL_DUTY_MAX + 1)
 		ldi	temp4, high(INDEX_CAL_DUTY_MAX + 1)
+		cpc	temp3, temp4
+		brcs	index_six_step_duty_valid
+		rjmp	index_six_step_invalid
+index_six_step_home_duty:
+		cpi	temp2, low(INDEX_HOME_DUTY_MIN)
+		ldi	temp4, high(INDEX_HOME_DUTY_MIN)
+		cpc	temp3, temp4
+		brcc	index_six_step_home_min_valid
+		rjmp	index_six_step_invalid
+index_six_step_home_min_valid:
+		cpi	temp2, low(INDEX_HOME_DUTY_MAX + 1)
+		ldi	temp4, high(INDEX_HOME_DUTY_MAX + 1)
 		cpc	temp3, temp4
 		brcs	index_six_step_duty_valid
 		rjmp	index_six_step_invalid

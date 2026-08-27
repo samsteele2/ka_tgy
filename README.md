@@ -1,416 +1,273 @@
-# KA SimonK sensored blade indexing fork
+# KA nFET ESC firmware
 
-This repository is a hardware-specific SimonK fork for the Kairos Autonomi
-ATmega8A n-channel ESC. Its purpose is to retain SimonK's proven sensorless
-motor operation in flight, then use an AS5600 magnetic encoder and low-voltage
-sensored control to place the stopped blades at a repeatable home position.
+Experimental ATmega8A firmware for PCB-783B1-02. Normal operation uses the
+existing SimonK sensorless ESC code. This fork adds AS5600 electrical calibration
+and post-run positioning to a stored mechanical home.
 
-> **Safety:** ESC firmware can destroy MOSFETs, motors, batteries, test
-> equipment, and propellers. Develop with the propeller removed, a
-> current-limited supply, and an emergency power disconnect. This build now
-> contains an experimental torque-producing index path; it has assembled and
-> passed static timing checks but has not yet been validated on the motor.
+> **Safety:** index mode controls voltage, not phase current. Use a
+> current-limited supply, begin below flight voltage, inspect all six gate
+> waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
+> limits each calibration pulse to 8.0 us. Calibration emits at most one pulse
+> per four 20 kHz frames (5 kHz effective, 4% average duty); this is not a
+> phase-current limit.
 
-## Intended behavior
+## System overview
 
-The final control sequence is:
+| Item | Implementation |
+|---|---|
+| MCU | ATmega8A at 16 MHz |
+| Normal drive | SimonK sensorless six-step commutation |
+| Command | RC PWM on PD2/INT0; legacy SimonK I2C is retained |
+| Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
+| Index update | 4.096 ms / 244.14 Hz |
+| Index drive | Sensored six-step; 20 kHz homing PDM, 5 kHz calibration pulses |
+| Persistent data | Mechanical home and electrical calibration in EEPROM |
+| Firmware image | `ka_nfet.hex` |
 
-1. Power-up and arming behave like normal SimonK. **Indexing never runs at
-   startup**, even if the throttle input is already below zero-throttle.
-2. A valid command above the programmed powered-on threshold starts and runs
-   the motor with SimonK's existing sensorless six-step commutation.
-3. When that same armed run later falls below the programmed zero-throttle
-   threshold, all normal SimonK phase drive is turned off and a 5-second stop
-   delay begins. This gives the blades time to coast to a stop.
-4. After the delay, the ESC reads the AS5600 through the ATmega8A TWI/I2C pins.
-   If electrical calibration is not present, it holds six-step vector zero at
-   minimum duty, steps to vector one, and raises only the low-side PWM duty
-   until AS5600 motion proves breakaway. It adds a small duty margin, then
-   walks the six active vectors through one electrical revolution forward and
-   backward. The measured motion gives encoder direction, pole-pair count,
-   electrical offset, and a motor-specific breakaway duty. A valid result is
-   committed to EEPROM and reused on later power cycles; a rejected result
-   produces four low-pitch pulses and leaves every FET off.
-   A 244.14 Hz control service moves an internal target along an acceleration-
-   limited profile. It reaches at most 15 RPM, then continuously tapers inside
-   roughly 12 mechanical degrees instead of stopping the target abruptly at
-   home. The torque command combines target-rate feed-forward, wrapped tracking
-   error, measured-rotor-motion damping, and a final-only bounded integral. The
-   feed-forward term begins applying useful torque while the target accelerates;
-   it does not wait for the rotor to stick far behind the target. A deterministic
-   first-order pulse-density modulator distributes the resulting learned-width
-   pulses over the 20 kHz carrier while one high-side source remains static.
-   There are no periodic braking packets.
-   When the slew target is home, rotor error is within four encoder counts, and
-   measured motion is no more than two counts per update, homing
-   completes: all six FETs turn off and AS5600 position polling stops for the
-   remainder of that stopped cycle.
-   If that first AS5600 read fails, the ESC gives two low-pitch warning pulses
-   once and cancels homing for that stopped cycle. If the encoder responds but
-   no home has been calibrated, it gives three low-pitch pulses instead.
-5. A valid throttle command above the threshold cancels waiting or indexing at
-   once (on the next accepted PWM frame) and returns to the existing SimonK
-   sensorless start/run path. Raising throttle always has priority over homing.
-6. A missing or unresponsive AS5600 must fail with all six MOSFETs off, never with a
-   stuck bus wait or an uncontrolled commutation pattern.
+The AS5600 is used only while the motor is stopped. SimonK is otherwise
+unchanged except for hooks that capture home, arm indexing after a run, and
+service calibration or positioning at zero throttle.
 
-The mechanical home is learned during SimonK's normal throttle calibration:
-power on with full throttle, then lower the command while the blades are held at
-the desired home position. When the low-throttle endpoint is committed to
-EEPROM, the current AS5600 angle and a validity marker are committed in the
-same write. An uncalibrated home prevents indexing and produces the three-low-
-pulse code after the normal 5-second delay. Capturing a new home invalidates
-the old electrical calibration. The next eligible post-run homing event
-recalibrates the complete motor/encoder assembly before returning to home.
+## Runtime sequence
 
-The trigger is a **high-to-low transition after a run**, not simply "throttle
-is low." This distinction is what prevents indexing at startup.
+1. Boot with all MOSFETs off and load EEPROM.
+2. Arm and run as a conventional SimonK ESC.
+3. A nonzero command arms one future index cycle. Power-up at zero throttle
+   cannot start indexing.
+4. On return to zero throttle, turn the bridge off and coast for
+   `INDEX_START_DELAY_SECONDS`.
+5. Read the AS5600. Abort with the bridge off if the sensor or stored home is
+   invalid.
+6. If the electrical record is invalid, run electrical calibration and commit
+   the result.
+7. Apply a direct position step to mechanical home and run the PI controller.
+8. When position and motion are within tolerance, turn the complete bridge off
+   until another nonzero run.
 
-## Current development stage
+A new nonzero throttle command always cancels calibration or positioning and
+returns control to SimonK.
 
-This is an experimental development build, not flight firmware.
+## Home and EEPROM data
 
-| Stage | Status |
-| --- | --- |
-| Recover the KA board definition and reproduce the known firmware | Complete; baseline is retained in Git history |
-| Document the actual PCB pinout and make reproducible build scripts | Complete |
-| Latch indexing only after a powered run and add the 5-second post-stop timer | Implemented and assembling |
-| Read AS5600 angle register `0x0E` as a 12-bit value over 400 kHz I2C | Implemented, bounded, and assembling; not yet hardware-validated |
-| Post-delay two-pulse AS5600 warning, three-pulse missing-home warning, and home capture during throttle calibration | Implemented and assembling; not yet hardware-validated |
-| Fail safely on I2C NACK/timeout and immediately yield to raised throttle | Implemented in the state-machine scaffold |
-| Acceleration-limited 15 RPM profile and feed-forward PID tracking | Implemented and assembling; hardware tuning remains |
-| Electrical-angle and signed torque-vector math | Implemented; requires motor calibration |
-| Generate sensored torque with continuous 20 kHz low-side pulse-density PWM | Implemented; replaces the audible drive/brake/coast packet envelope; hardware tuning is in progress |
-| Automatically determine breakaway duty, encoder direction, pole pairs, and electrical offset | Implemented as a bounded six-vector forward/reverse sweep with EEPROM persistence; not yet hardware-validated |
-| Tune and validate with the actual motor, encoder, supply, and gate stage | In progress; the current build adds profiled feed-forward and measured settling |
+Throttle calibration captures the AS5600 angle at the learned low-throttle
+endpoint as mechanical home. A new home invalidates the electrical record so it
+is recalibrated on the next eligible stop.
 
-`INDEX_ENABLE` and `INDEX_DRIVE_ENABLE` are currently `1`. A calibrated EEPROM
-home is required before the post-run state machine will energize the motor.
-The index backend uses the same six proven two-phase active vectors as SimonK.
-For each sector, one high-side source FET stays on continuously and only the
-selected low-side sink is PWM-switched. Timer2 uses an index-specific 800-cycle
-period, approximately 20 kHz at 16 MHz. Complementary PWM is explicitly
-disabled in index mode. Calibration uses every carrier frame. During homing,
-the individual pulse width remains the learned breakaway value and a first-
-order accumulator distributes pulses according to the tracking-command magnitude.
-This provides fractional average torque without random timing and removes the
-old 244 Hz drive/brake/coast envelope. A zero command coasts immediately; no
-three-low-side dynamic brake is used.
-Every sector change first turns all six FETs off for 5 us, turns on the new
-high-side source, waits another 5 us for the measured slow gate transition,
-and only then starts low-side PWM.
+The EEPROM record contains:
 
-Six-step control has more torque ripple and detent-like motion than true
-three-phase FOC, but final position is still measured directly by the AS5600.
-Reaching the final four-count window at low measured motion is terminal: the drive is shut down and no
-holding or drift-correction current is applied until another run/stop cycle.
+- mechanical home and its validity marker;
+- encoder direction and pole-pair count;
+- electrical-angle offset;
+- calibrated low-side operating pulse width;
+- measured breakaway density; and
+- electrical record marker `0x5e`, written last as the commit.
 
-Electrical calibration is intentionally independent of SimonK's back-EMF
-timing. At the first eligible stop after throttle/home calibration, vector zero
-is held at 56 Timer2 cycles (3.5 us) until the encoder is stable. Vector one then
-starts at that duty and rises by four cycles every 49.152 ms until at least four
-AS5600 counts of motion are observed, with a ceiling of 128 cycles (8.0 us,
-about 16% of the carrier period). An eight-cycle margin is stored with the
-result. Alignment and both sweep endpoints are accepted only after 64 samples
-(262.144 ms) stay within a two-count window with no sample jump over one count.
-Each hold has a 3.002-second timeout and rejects calibration rather than
-measuring a rotor that is still moving. Each complete six-vector sweep takes
-2.097152 seconds. With promptly settling hardware, calibration takes about
-5.2 to 6.2 seconds after the normal 5-second coast delay. For a seven-pole-pair
-motor, each sweep moves the shaft about 51.4 degrees at about 4.09 RPM before
-returning it to the starting magnetic alignment.
+Breakaway density remains part of the electrical-calibration record but is not
+used by the position controller.
 
-The reference STM32 implementation in
-`C:\Users\Sam\dev\OutbounderDesktop\Core\Src` informed the AS5600 register
-selection and rotor-angle conventions. It cannot be copied directly: that
-target has three independent hardware PWM timer channels, while this ATmega8A
-has one software-selected Timer2 PWM phase. This fork therefore uses sensored
-trapezoidal six-step control rather than emulating three-phase FOC. Normal
-SimonK sensorless commutation and PWM remain unchanged outside index mode.
+## Electrical calibration
 
-## Hardware target and pin map
+Calibration logic runs every 4.096 ms and directly commands a stationary or
+slowly rotating six-step field. The low-side FET receives one pulse per four
+20 kHz carrier frames: 5 kHz effective. The selected high-side source remains
+on for the vector, but conducts phase current only during the low-side pulse and
+motor-current decay.
 
-The board runs an ATmega8A at 16 MHz. `ka_nfet.inc` is the authoritative board
-definition.
+| Phase | Behavior |
+|---|---|
+| Initial hold | Apply vector 0 at minimum pulse width until motion remains inside the encoder-noise band for 64 samples (262.144 ms). Timeout is approximately 3 s. |
+| Excitation search | Alternate vectors 0 and 1 every 12 samples while increasing pulse width by eight Timer2 cycles (0.5 us). Require four consecutive samples beyond the full noise band before accepting movement. |
+| Operating pulse | Save the measured threshold and use threshold + 16 Timer2 cycles (1 us), capped by `INDEX_CAL_DUTY_MAX`. |
+| Alignment | Hold vector 0 until mechanically settled. |
+| Forward sweep | Advance the field by 8/4096 electrical revolution per update for two electrical revolutions, then settle. |
+| Reverse sweep | Return through two electrical revolutions and settle. |
+| Validation | Require opposite travel signs, matched magnitudes, return to the initial position, 1–20 pole pairs, and bounded pole-fit error. |
+| Commit | Calculate direction, pole pairs, electrical offset, pulse width, and breakaway density; write the validity marker last. |
 
-| MCU pin | PCB net / purpose | Firmware name |
-| --- | --- | --- |
-| PD2 / INT0 | PWM throttle input | `rcp_in` |
-| PD5, PB0, PD3 | HS_PhaseA, HS_PhaseB, HS_PhaseC | `ApFET`, `BpFET`, `CpFET` |
-| PD4, PD7, PC3 | LS_PhaseA, LS_PhaseB, LS_PhaseC | `AnFET`, `BnFET`, `CnFET` |
-| ADC6, ADC7, PC0 / ADC0 | SenseA, SenseB, SenseC | `mux_a`, `mux_b`, `mux_c` |
-| PD6 / AIN0 | SenseX comparator reference | comparator input |
-| PC4 / SDA | AS5600 data | AVR TWI SDA |
-| PC5 / SCL | AS5600 clock | AVR TWI SCL |
-| PC2 / ADC2 | battery-voltage divider | `mux_voltage` |
-| PC1 / ADC1 | NTC thermistor | `mux_temperature` |
-| PB1 | RUN LED net (not populated/connected on PCB-783B1-02) | `green_led` |
-| PB2 | WARN LED net (not populated/connected on PCB-783B1-02) | `red_led` |
-| PB3, PB4, PB5, RESET | MOSI, MISO, SCK, reset | USBasp / ICSP |
-| PD0, PD1 | unused RX/TX interface | legacy UART definitions |
+With `INDEX_CAL_NOISE_DELTA = 3`, settling permits a three-count instantaneous
+delta and six-count total window excursion. Movement proof requires at least
+seven counts from baseline for four consecutive samples.
 
-The AS5600 uses 7-bit address `0x36`; the assembly consequently sends `0x6C`
-for write and `0x6D` for read. The present code reads filtered `ANGLE` at
-registers `0x0E`/`0x0F`, masks it to 12 bits, and stores values from 0 through
-4095. SDA and SCL require pull-up resistors to the common logic supply; verify
-their value and voltage on the actual encoder board before connecting it.
+### Calibration frequency rationale
 
-## Source layout
+The audible 5 kHz calibration pulse rate is intentional. Earlier calibration
+used a low-side pulse in every 20 kHz carrier frame. With the rotor stationary
+and therefore producing no back-EMF, the winding current did not decay
+sufficiently during the approximately 46 us off-time. Successive pulses
+accumulated phase current, causing excessive supply current and high-side FET
+heating. Hardware testing showed approximately eight times less calibration
+input current after changing to an 8 us pulse every 200 us.
 
-- `tgy.asm` — SimonK core plus the KA indexing state machine and AS5600 master
-  transaction.
-- `ka_nfet.inc` — KA pin mapping and indexing compile-time configuration.
-- `other_escs/` — inherited SimonK board definitions and `m8def.inc`; retained
-  for source history and assembler includes, not built by the one-click scripts.
-- `build.bat`, `flash.bat`, `build.sh`, `flash.sh` — root-level build and
-  flash entry points.
-- `scripts/` — PowerShell implementations used by the Windows batch launchers.
-  They assemble directly in the repository root and leave no copied `tgy.asm`
-  in a build directory.
-- `ka_nfet.hex` — generated Intel HEX output. Rebuild it after source changes.
+Timer2 still runs at 20 kHz, but calibration emits only one pulse per four
+frames. The resulting 5 kHz winding-current and torque excitation can therefore
+be audible. Restoring an ultrasonic *electrical excitation* is not considered a
+safe timing-only change: it would require substantially shorter pulses, closed-
+loop phase-current regulation, or an actively controlled fast-decay state. The
+present waveform deliberately favors bounded current and FET temperature over
+inaudible calibration.
 
-Important indexing settings near the top of `ka_nfet.inc` are:
+The selected high-side source remains statically enabled within each six-step
+vector; only the low-side sink is carrier-switched. High-side temperature during
+calibration is consequently treated primarily as a phase-current/conduction or
+gate-enhancement concern, not as 20 kHz high-side switching loss.
 
-- `INDEX_ENABLE` — include the state machine and AS5600 reads.
-- `INDEX_DRIVE_ENABLE` — compile gate for energized index-mode output; use `0`
-  for sensor-only commissioning.
-- `INDEX_START_DELAY_SECONDS` — whole seconds of all-off coasting before the
-  first encoder read. The implementation derives Timer1 ticks from this value.
-- `INDEX_SLEW_RPM` — maximum mechanical target speed. Acceleration and final
-  tapering remain internal implementation details.
-- `INDEX_P_GAIN` and `INDEX_D_GAIN` — gain numerators in sixteenths. For example,
-  `4` means 0.25 and `16` means 1.0. The current values are P=1.50 and D=0.50.
-- `INDEX_I_GAIN` and `INDEX_I_MAX` — final-only static-error correction and its
-  accumulator clamp. I gain uses the same sixteenths scale and is currently
-  0.50. Integral action remains disabled while the target moves.
-- `INDEX_FF_GAIN` — feed-forward logical command per target
-  encoder-count/update. A value of 64 produces `target_rate / 4`; the current
-  tuned value is 0.
-- `INDEX_STUCK_DELTA` — maximum absolute encoder change per 4.096 ms sample
-  considered virtually stopped. The default of 3 tolerates AS5600 noise while
-  still requiring 16 consecutive low-motion samples before breakaway assistance.
-- `INDEX_CAL_DUTY_MAX` — hard safety ceiling for the breakaway search. Normal
-  calibration and homing use the measured raw threshold plus an internal
-  eight-cycle operating margin, not this ceiling.
-- `INDEX_DEADTIME_US` — board-specific all-off time around vector changes.
+Failure behavior:
 
-State values, I2C protocol constants, calibration acceptance limits, settle
-timing, fixed-point scales, and derived carrier timing remain private to
-`tgy.asm`. With the current values, the tracking law is
-`1.50 * error - 0.50 * rotor_delta + 0.50 * (integral / 32)`, where the integral
-term is bounded by 8191, disabled while the target moves, and reset on an
-error-sign change.
+- AS5600 transaction failure: bridge off, two low beeps;
+- missing mechanical home: bridge off, three low beeps;
+- rejected electrical calibration: bridge off, four low beeps.
 
-For an underdamped response, reduce `INDEX_P_GAIN` first or raise
-`INDEX_D_GAIN`; change one at a time. Reduce `INDEX_FF_GAIN` if overshoot begins
-during commanded acceleration rather than during final position correction.
-`INDEX_I_GAIN` and `INDEX_I_MAX` affect only the final stopped-target phase and
-should not be used to correct oscillation during the slew.
+## Index power stage
 
-Static-torque threshold, bounded operating duty, pole pairs, encoder direction,
-and encoder/electrical zero offset are measured per assembly and stored in
-EEPROM rather than compiled into the image. The breakaway search alternates two
-fields 60 electrical degrees apart while ramping from minimum duty, preventing
-an aligned or anti-aligned starting position from hiding at zero torque. Once
-motion is detected, alignment and the two-turn geometry sweeps use only the
-measured threshold plus an eight-cycle margin. During homing, moving torque is
-continuous down to one pulse-density count. Breakaway compensation is enabled
-only after 16 consecutive samples at or below `INDEX_STUCK_DELTA` and is removed
-when measured motion exceeds that threshold, avoiding both encoder-noise resets
-and a discontinuous torque reversal around home. A zero fixed-point PID result
-does not clear this measured-motion history; when error remains outside the home
-tolerance, the controller applies breakaway torque in the error direction.
-The configured ceiling is never selected merely because position error is large.
+The calibrated pole count, encoder direction, and electrical offset convert
+mechanical angle to rotor electrical angle. Controller sign requests positive or
+negative 90-degree electrical torque angle, rounded to the nearest of six active
+vectors.
 
-Calibration accepts breakaway only after four consecutive samples remain beyond
-the full configured encoder-noise band. This calibration format invalidates the
-previous electrical record while preserving the stored mechanical home. The
-first eligible post-run stop after flashing therefore performs electrical
-calibration once.
+Each vector energizes one high-side source and a different phase low-side sink.
+Only the sink is pulsed. A vector transition performs:
 
-## Installing AVRA
+1. all six MOSFETs off;
+2. `INDEX_DEADTIME_US` all-off delay;
+3. select one high-side source;
+4. another `INDEX_DEADTIME_US` delay; and
+5. start low-side pulses on the sink phase.
 
-The build uses [AVRA](https://github.com/Ro5bert/avra), an open-source assembler
-compatible with the AVRASM syntax used by SimonK. Confirm installation with:
+Calibration uses 7.0-8.0 us low-side pulses at 5 kHz effective, for 3.5-4.0%
+average applied duty. The measured sparse-pulse threshold is converted to the
+homing timer domain; homing retains 3.5-4.0 us pulses and an 8-bit first-order
+accumulator varies their density from 0 to 255 frames at a 20 kHz carrier. Zero
+controller output coasts; indexing never applies dynamic braking.
+
+## Position-control specification
+
+Angles use AS5600 counts: 4096 counts per mechanical revolution. Position and
+sample-to-sample motion are wrapped to the signed range -2048 to 2047.
+
+### Direct step
+
+At index start, the demanded position immediately becomes mechanical home.
+There is no target trajectory, acceleration limit, RPM limit, taper, or
+feed-forward term.
+
+### PI law
+
+Every 4.096 ms:
 
 ```text
-avra --version
+error[k] = wrapped(home - position[k])
+if error[k] crossed zero:
+    integral[k-1] = 0
+integral[k] = clamp(integral[k-1] + error[k], -I_MAX, I_MAX)
+
+u = trunc(P * error[k])
+  + trunc(I * trunc(integral[k] / 32))
 ```
 
-### Windows (tested project setup)
+P and I are configured in sixteenths. Integral action runs on every control
+update, including while output is saturated and while the rotor is moving. The
+accumulator is cleared when the signed position error changes sign or is exactly
+zero, preventing stored torque from continuing in the old direction after the
+rotor crosses home. Between crossings, `INDEX_I_MAX` bounds its magnitude.
 
-There is no dependable first-party `winget` AVRA package. This project has been
-verified with AVRA 1.3.0 compiled as a small native Windows executable using
-TinyCC 0.9.27. Download and extract:
+The signed command is saturated to -255 through 255. Its magnitude directly
+sets pulse density and its sign selects torque direction. There is no stall
+counter, dead-zone inversion, learned minimum output, or homing breakaway pulse.
 
-- [AVRA 1.3.0 source](https://github.com/Ro5bert/avra/archive/refs/tags/1.3.0.zip)
-- [TinyCC 0.9.27 win64](https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip)
+Current checked-in values are:
 
-Set the first two paths below to the extracted directories, then run the block
-in PowerShell:
+| Setting | Value | Effective behavior |
+|---|---:|---|
+| `INDEX_P_GAIN` | 8 | P = 0.50 |
+| `INDEX_I_GAIN` | 4 | I = 0.25 |
+| `INDEX_I_MAX` | 16348 | Symmetric integral-accumulator clamp |
+| `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
+
+### Completion
+
+Homing completes when both conditions are true:
+
+- absolute position error is inside `INDEX_HOME_DEADZONE_MINUTES`; and
+- absolute raw one-sample rotor delta is at most two counts.
+
+The deadzone setting is expressed in angular minutes, where 60 minutes equals
+one degree. Firmware converts it to the nearest AS5600 count at assembly time;
+180 minutes becomes 34 counts, or approximately 2.99 degrees on either side of
+home.
+
+Completion immediately turns the bridge off and is terminal for that stopped
+cycle.
+
+## Remaining predictable edge cases
+
+The controller is substantially simpler, but these behaviors are intentional:
+
+- With P = 0.50, position errors of approximately 510 counts or more saturate the
+  output immediately. Most initial home steps therefore begin at maximum pulse
+  density.
+- The integral can still reach its clamp during a saturated approach, although
+  crossing home clears it before accumulation begins in the opposite direction.
+- There is no derivative term or electronic velocity damping.
+- Output remains quantized by 8-bit pulse density and six 60-degree electrical
+  vectors.
+- The exact 180-degree position error has two equivalent paths; signed wrapping
+  selects one.
+- Position control uses the calibrated pulse width but has no current feedback.
+
+Tune P first, then introduce I only as needed to overcome steady position error.
+Use `INDEX_I_MAX` to bound the maximum stored integral torque.
+
+## User configuration
+
+User-facing settings are in `ka_nfet.inc`:
+
+| Setting | Purpose |
+|---|---|
+| `INDEX_ENABLE` | Compile AS5600 indexing. |
+| `INDEX_DRIVE_ENABLE` | Set to 0 for sensor-only commissioning. |
+| `INDEX_START_DELAY_SECONDS` | All-off coast time after zero throttle. |
+| `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
+| `INDEX_I_MAX` | Integral accumulator limit. |
+| `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
+| `INDEX_CAL_NOISE_DELTA` | Electrical-calibration encoder-noise band. |
+| `INDEX_CAL_DUTY_MAX` | 128 cycles: 8.0 us at 5 kHz effective / 4% average-duty ceiling. |
+| `INDEX_DEADTIME_US` | All-off delay around vector changes. |
+
+Protocol constants, state values, validation tolerances, and fixed-point scales
+remain private to `tgy.asm`.
+
+## Build and flash
+
+Build with AVRA:
 
 ```powershell
-$TccRoot = 'C:\Tools\tcc-0.9.27-win64-bin'
-$AvraRoot = 'C:\Tools\avra-1.3.0'
-$AvraSrc = Join-Path $AvraRoot 'src'
-$InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\AVRA'
-
-$SourceNames = @(
-    'avra.c', 'device.c', 'parser.c', 'expr.c', 'mnemonic.c',
-    'directiv.c', 'macro.c', 'file.c', 'map.c', 'coff.c',
-    'args.c', 'stdextra.c'
-)
-$Sources = $SourceNames | ForEach-Object { Join-Path $AvraSrc $_ }
-
-& (Join-Path $TccRoot 'tcc.exe') `
-    -Wall -O3 "-I$(Join-Path $TccRoot 'include\sys')" `
-    -o (Join-Path $AvraSrc 'avra.exe') $Sources
-if ($LASTEXITCODE -ne 0) { throw 'AVRA compilation failed.' }
-
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item (Join-Path $AvraSrc 'avra.exe') $InstallDir -Force
-
-$UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (($UserPath -split ';') -notcontains $InstallDir) {
-    [Environment]::SetEnvironmentVariable(
-        'Path', ($UserPath.TrimEnd(';') + ';' + $InstallDir), 'User'
-    )
-}
-& (Join-Path $InstallDir 'avra.exe') --version
+.\build.bat
 ```
 
-Open a new terminal after changing `PATH`. Even without that restart,
-`scripts/build.ps1` also checks the exact fallback location
-`%LOCALAPPDATA%\Programs\AVRA\avra.exe` used above.
-
-The official AVRA repository also documents a Visual Studio source-build route
-for newer AVRA releases, but 1.3.0 is the version used for the recovered KA
-baseline and is therefore the reproducibility reference for this fork.
-
-### macOS
-
-Install [Homebrew](https://brew.sh/) if it is not already installed, then use
-the maintained [Homebrew AVRA formula](https://formulae.brew.sh/formula/avra.html):
-
-```sh
-brew update
-brew install avra
-avra --version
-```
-
-The Homebrew formula currently supplies both Apple Silicon and Intel bottles.
-If Homebrew cannot be used, AVRA's upstream source build is `make` followed by
-`sudo make install`; see the upstream README for its toolchain prerequisites.
-
-## Building
-
-### Windows
-
-Double-click `build.bat`, or run:
-
-```powershell
-.\scripts\build.ps1
-```
-
-### macOS
-
-From Terminal:
-
-```sh
-chmod +x build.sh
+```bash
 ./build.sh
 ```
 
-To flash a reviewed `ka_nfet.hex` with USBasp, first install AVRDUDE
-(`brew install avrdude`), then run:
+The current normal build uses 6256 application bytes and 108 bytes of SRAM,
+leaving 912 bytes before the boot section at word address `0x0E00`.
 
-```sh
-chmod +x flash.sh
+The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
+fuse `0xCA`, then verify them. They do not rebuild:
+
+```powershell
+.\flash.bat
+```
+
+```bash
 ./flash.sh
 ```
 
-Both paths define `ka_nfet_esc`, add the repository and `other_escs` include
-directories, assemble `tgy.asm`, and write `ka_nfet.hex` in the repository root.
-Intermediate `.obj`, `.cof`, and EEPROM HEX files are removed.
+Review the image and fuse values for the exact board before programming.
 
-The current experimental build assembles without errors and reports:
+## Source map
 
-- application code through word address `0x0D19` (6708 bytes),
-- bootloader beginning at word address `0x0E00`, leaving 460 bytes of unused
-  application flash before the boot section,
-- 116 bytes of SRAM allocated out of the ATmega8A's 1024 bytes.
-
-There is ample raw program and data memory for the state machine and fixed-point
-encoder/electrical-angle math. The more important constraint is deterministic
-gate switching and conservative current during stationary six-step drive.
-
-## First energized bench test
-
-Remove the propeller and mechanically unload the motor. Use a current-limited
-supply and begin below the normal flight voltage if the gate supply permits it.
-
-1. Perform normal SimonK throttle calibration while holding the shaft at the
-   desired mechanical home. This stores both low throttle and home in EEPROM.
-2. Reboot at low throttle. The startup tones should be normal and indexing must
-   not occur.
-3. Command a brief normal sensorless run, then return below zero throttle.
-4. Confirm all phases remain off for approximately 5 seconds. On this first
-   cycle, expect a low-duty hold, an alternating-vector breakaway-duty search,
-   an alignment hold, two slow electrical revolutions forward and two backward,
-   and then
-   normal homing. For seven pole pairs, each calibration sweep is about 102.9
-   mechanical degrees at 4.09 RPM.
-5. After calibration completes, homing should begin at approximately 15 RPM
-   and take the shortest path to the stored mechanical home. Motion should
-   accelerate smoothly into continuous feed-forward/PID-controlled torque, then
-   show decreasing speed and pulse density through the final approach. There
-   should be no periodic three-phase braking. At
-   home, verify that phase current falls to zero and remains off; the firmware
-   no longer polls or corrects position during that stopped cycle. On
-   subsequent run/stop cycles, calibration is skipped and homing starts
-   directly after the five-second delay.
-6. Raise throttle during calibration or homing and confirm that the index drive
-   stops on the next accepted PWM command and normal SimonK control resumes.
-7. Repeat once with the AS5600 disconnected: after the delay, expect two low
-   pulses and no homing. Erase or invalidate the stored home to exercise the
-   three-low-pulse code. A deliberately blocked or otherwise rejected
-   electrical sweep should produce four low pulses.
-
-During the first energized test, stop immediately if motion accelerates away
-from the commanded calibration vector or slew target, phase current is
-excessive, the low-side carrier is not near 20 kHz, or any sector change
-lacks the all-off interval. Those symptoms indicate a failed field capture, an
-invalid AS5600 installation, or an incorrect phase-vector mapping.
-
-## Reading, comparing, and flashing with USBasp
-
-AVRA builds firmware; [AVRDUDE](https://github.com/avrdudes/avrdude) communicates
-with USBasp. With the ESC separately and safely powered as required by the
-board, read flash to Intel HEX with:
-
-```powershell
-avrdude -c usbasp -p m8 -U flash:r:ka_nfet_ripped.hex:i
-```
-
-`flash.bat` and `flash.sh` do **not** build. They program the `ka_nfet.hex`
-alongside them, write the KA board's fuse values (`lfuse=0x3F`, `hfuse=0xCA`),
-and verify all three. This permits a production flashing bundle with no source
-or assembler installed. The lock byte is left unchanged. To flash an
-already-built image manually without changing fuses:
-
-```powershell
-avrdude -c usbasp -p m8 -U flash:w:ka_nfet.hex:i
-```
-
-The fuse values in `scripts/flash.ps1` are specific to this recovered KA board:
-external clock operation, SPI programming, a 512-word boot section, and reset
-through the bootloader. Do not reuse them for a different ESC layout without
-checking that target's clock and boot configuration.
-
-## Upstream and license
-
-This fork derives from [SimonK `tgy`](https://github.com/sim-/tgy), itself based
-on Bernhard Konze's `tp-18a`, and retains the upstream copyright, license terms,
-and no-warranty notice in `tgy.asm`. Please preserve those notices in derived
-firmware. The original warning remains especially relevant: always test without
-propellers, and expect ESC or FET damage while developing switching code.
+- `tgy.asm` — SimonK base plus AS5600 calibration and position control.
+- `ka_nfet.inc` — PCB pin map and user-facing configuration.
+- `ka_nfet.hex` — generated firmware image.
+- `scripts/build.ps1`, `build.sh` — AVRA builds.
+- `scripts/flash.ps1`, `flash.sh` — USBasp programming and verification.
