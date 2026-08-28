@@ -100,11 +100,14 @@ system off before inspecting it.
 | 5 | Homing did not finish within eight seconds | Check for an obstruction, excessive friction, a slipping propeller assembly, or inability to hold the home position. |
 | 6 | Calibration detected an implausibly large rotor step | Check the encoder magnet and mounting, intermittent sensor wiring, and sudden mechanical movement. |
 | 7 | Complete calibration sweeps did not agree | Check for a blocked or binding shaft and make sure the propeller or load is not forcing inconsistent forward and reverse movement. |
+| 8 | AS5600 magnet field is too weak (`ML`) | Reduce the sensor-to-magnet air gap and check magnet strength, centering, and orientation. Homing continues after this advisory code. |
 | 9 | Invalid internal calibration state | Cycle power once. If it repeats, reflash the verified HEX and report the fault. |
+| 10 | AS5600 magnet field is too strong (`MH`) | Increase the sensor-to-magnet air gap and check magnet strength and centering. Homing continues after this advisory code. |
 
 Startup tones and throttle-calibration acknowledgments are not fault codes.
-Fault codes in this table are low-pitched groups produced after calibration or
-homing has stopped.
+Codes 8 and 10 are advisory and sound immediately before the motor starts
+homing; they do not inhibit homing. The other low-pitched groups report a
+stopped calibration or homing sequence.
 
 ## If calibration repeatedly fails
 

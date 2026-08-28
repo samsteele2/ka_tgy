@@ -131,8 +131,26 @@ Failure behavior:
 - electrical-calibration settling timeout: bridge off, four low beeps;
 - homing timeout: bridge off, five low beeps;
 - gross calibration step above 1024 counts: bridge off, six low beeps;
-- aggregate sweep direction, return, or travel rejection: bridge off, seven low beeps; and
-- invalid internal calibration state: bridge off, nine low beeps.
+- aggregate sweep direction, return, or travel rejection: bridge off, seven low beeps;
+- AS5600 magnet field too weak (`ML`): eight low beeps immediately before homing, then homing continues;
+- invalid internal calibration state: bridge off, nine low beeps; and
+- AS5600 magnet field too strong (`MH`): ten low beeps immediately before homing, then homing continues.
+
+### AS5600 angle and filter configuration
+
+All position feedback comes from the 12-bit `RAW ANGLE` registers (`0x0C` and
+`0x0D`), not the scaled `ANGLE` registers. This avoids the `ANGLE` path's range
+scaling and 10-LSB hysteresis at the 0/360-degree boundary. Each read begins at
+`STATUS` (`0x0B`) and receives status plus both raw-angle bytes in one I2C burst.
+
+Before mechanical-home capture and before an indexing sequence, firmware writes
+a known volatile AS5600 configuration: normal power mode, output hysteresis off,
+8x slow filtering, fast-threshold filtering off, and watchdog off. The 8x slow
+filter has an approximately 1.1 ms documented step response, which settles well
+inside the 4.096 ms position-control interval while retaining low output noise.
+Disabling the watchdog also keeps sensor behavior consistent after the rotor has
+been stationary for a long time. The analog-output selection is left at its
+default full-range mode but is irrelevant because this firmware uses I2C only.
 
 ## Index power stage
 

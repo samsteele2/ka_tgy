@@ -33,7 +33,7 @@
 ; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
 .equ	INDEX_P_GAIN			= 12
 .equ	INDEX_I_GAIN			= 2
-.equ	INDEX_D_GAIN			= 32	; Measured-motion damping (0.5 command/count/update)
+.equ	INDEX_D_GAIN			= 32
 .equ	INDEX_I_MAX				= 16384
 .equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 180 = 3 degrees from home
 .equ	INDEX_HOME_SLEW_RPM		= 60	; Mechanical target speed toward home

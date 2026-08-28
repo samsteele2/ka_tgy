@@ -308,7 +308,13 @@
 
 .equ	INDEX_AS5600_ADDR_W = 0x6c
 .equ	INDEX_AS5600_ADDR_R = 0x6d
-.equ	INDEX_AS5600_ANGLE_REG = 0x0e
+.equ	INDEX_AS5600_CONF_REG = 0x07
+.equ	INDEX_AS5600_STATUS_REG = 0x0b
+.equ	INDEX_AS5600_RAW_ANGLE_REG = 0x0c
+.equ	INDEX_AS5600_CONF_L = 0x00	; Normal power, no output hysteresis
+.equ	INDEX_AS5600_CONF_H = 0x01	; 8x slow filter, fast filter/watchdog disabled
+.equ	INDEX_AS5600_STATUS_MH = 3	; Magnet field strength too high
+.equ	INDEX_AS5600_STATUS_ML = 4	; Magnet field strength too low
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
 .equ	INDEX_HOME_MARKER = 0xa5
 .equ	INDEX_ELECTRICAL_MARKER = 0x60	; Aggregate sweep / averaged-offset record
@@ -367,7 +373,9 @@
 .equ	INDEX_CAL_FAIL_SETTLE = 4	; Four low beeps
 .equ	INDEX_CAL_FAIL_STEP = 6		; Six: implausibly large settled step
 .equ	INDEX_CAL_FAIL_RETURN = 7	; Seven: sweep direction/return/travel
+.equ	INDEX_WARN_MAGNET_LOW = 8	; Eight: AS5600 magnet field too weak
 .equ	INDEX_CAL_FAIL_INTERNAL = 9	; Nine: impossible calibration state
+.equ	INDEX_WARN_MAGNET_HIGH = 10	; Ten: AS5600 magnet field too strong
 .endif
 
 .equ	PWR_COOL_START	= (POWER_RANGE/24) ; Power limit while starting to reduce heating
@@ -533,6 +541,7 @@ index_delay_l:	.byte	1	; Selected homing/calibration delay in overflow ticks
 index_delay_h:	.byte	1
 index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
 index_angle_h:	.byte	1
+index_as5600_status: .byte 1	; STATUS sampled with the raw mechanical angle
 index_target_l: .byte 1	; Slewed mechanical position demand, 0..4095
 index_target_h: .byte 1
 index_target_fraction: .byte 1 ; Q8 rate remainder for four/five-count stepping
@@ -3577,6 +3586,8 @@ index_electrical_invalid:
 index_calibrate_home:
 		ldi	temp1, 0xff		; A new installation/home capture requires a fresh motor calibration
 		sts	index_electrical_valid, temp1
+		rcall	index_as5600_configure
+		brcs	index_calibrate_home_invalid
 		rcall	index_as5600_read
 		brcs	index_calibrate_home_invalid
 		lds	temp1, index_angle_l
@@ -3649,13 +3660,21 @@ index_poll:	lds	temp1, index_state
 		cp	temp1, temp3
 		cpc	temp2, temp4
 		brcs	index_poll_ret
+		rcall	index_as5600_configure
+		brcs	index_sensor_fault
 		rcall	index_as5600_read
 		brcs	index_sensor_fault
 		rcall	index_home_is_valid
 		brcs	index_home_missing
 		rcall	index_electrical_is_valid
-		brcc	index_home_begin
+		brcc	index_home_preflight
 		rjmp	index_calibration_start
+index_home_preflight:
+		; Diagnostics are advisory: sound them with the bridge otherwise off,
+		; then refresh the raw angle because the tone can move the rotor slightly.
+		rcall	index_as5600_warn_status
+		rcall	index_as5600_read
+		brcs	index_sensor_fault
 index_home_begin:
 		rcall	index_foc_reset
 		lds	temp1, index_state
@@ -4860,6 +4879,11 @@ index_calibration_offset_store:
 		brcc	index_calibration_commit_read_ok
 		rjmp	index_sensor_fault
 index_calibration_commit_read_ok:
+		rcall	index_as5600_warn_status
+		rcall	index_as5600_read
+		brcc	index_calibration_commit_refresh_ok
+		rjmp	index_sensor_fault
+index_calibration_commit_refresh_ok:
 		rjmp	index_home_begin
 
 	; Low-beep counts are unique across index-mode failures: two sensor, three
@@ -4908,8 +4932,79 @@ index_twi_wait1:
 index_twi_ok:	clc
 		ret
 
-	; Read AS5600 ANGLE (0x0e/0x0f). Result is stored in index_angle_h:l.
-	; Transaction: START, SLA+W, register, repeated START, SLA+R, two bytes.
+	; Program a known volatile sensor profile before home capture or indexing.
+	; 8x slow filtering has about 1.1 ms response, safely below the 4.096 ms
+	; control period. Fast-threshold filtering is disabled to avoid mode-dependent
+	; noise, and the watchdog is disabled so long stationary periods do not alter
+	; sensor response. The analog OUT mode is immaterial because only I2C is used.
+index_as5600_configure:
+		out	TWCR, ZH		; Disable legacy slave interrupt first
+		out	TWSR, ZH		; Prescaler = 1
+		outi	TWBR, INDEX_TWBR, temp1
+
+		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x08
+		brne	index_as5600_config_error
+
+		outi	TWDR, INDEX_AS5600_ADDR_W, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x18
+		brne	index_as5600_config_error
+
+		outi	TWDR, INDEX_AS5600_CONF_REG, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_config_error
+
+		outi	TWDR, INDEX_AS5600_CONF_L, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_config_error
+
+		outi	TWDR, INDEX_AS5600_CONF_H, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_config_error
+
+		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
+		out	TWCR, temp1
+		ldi	temp2, 0xff		; Do not start a read until STOP has left the bus
+index_as5600_configure_stop_wait:
+		in	temp1, TWCR
+		sbrs	temp1, TWSTO
+		rjmp	index_as5600_configure_done
+		dec	temp2
+		brne	index_as5600_configure_stop_wait
+		rjmp	index_as5600_error
+index_as5600_configure_done:
+		clc
+		ret
+index_as5600_config_error:
+		rjmp	index_as5600_error
+
+	; Read STATUS (0x0b) and RAW ANGLE (0x0c/0x0d) in one burst. RAW ANGLE is
+	; the unscaled/unmodified 12-bit position; ANGLE's scaling and 10-LSB
+	; wrap hysteresis are deliberately bypassed.
 index_as5600_read:
 		out	TWCR, ZH		; Disable legacy slave interrupt first
 		out	TWSR, ZH		; Prescaler = 1
@@ -4917,22 +5012,28 @@ index_as5600_read:
 
 		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
 		rcall	index_twi_wait
-		brcs	index_as5600_error
+		brcc	index_as5600_read_start_ok
+		rjmp	index_as5600_error
+index_as5600_read_start_ok:
 		in	temp1, TWSR
 		andi	temp1, 0xf8
 		cpi	temp1, 0x08
-		brne	index_as5600_error
+		breq	index_as5600_read_start_status_ok
+		rjmp	index_as5600_error
+index_as5600_read_start_status_ok:
 
 		outi	TWDR, INDEX_AS5600_ADDR_W, temp1
 		ldi	temp1, (1<<TWINT)|(1<<TWEN)
 		rcall	index_twi_wait
-		brcs	index_as5600_error
+		brcc	index_as5600_read_address_wait_ok
+		rjmp	index_as5600_error
+index_as5600_read_address_wait_ok:
 		in	temp1, TWSR
 		andi	temp1, 0xf8
 		cpi	temp1, 0x18
 		brne	index_as5600_error
 
-		outi	TWDR, INDEX_AS5600_ANGLE_REG, temp1
+		outi	TWDR, INDEX_AS5600_STATUS_REG, temp1
 		ldi	temp1, (1<<TWINT)|(1<<TWEN)
 		rcall	index_twi_wait
 		brcs	index_as5600_error
@@ -4966,6 +5067,16 @@ index_as5600_read:
 		cpi	temp1, 0x50
 		brne	index_as5600_error
 		in	temp1, TWDR
+		sts	index_as5600_status, temp1
+
+		ldi	temp1, (1<<TWINT)|(1<<TWEA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x50
+		brne	index_as5600_error
+		in	temp1, TWDR
 		andi	temp1, 0x0f
 		sts	index_angle_h, temp1
 
@@ -4987,6 +5098,34 @@ index_as5600_error:
 		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
 		out	TWCR, temp1
 		sec
+		ret
+
+	; Advisory magnet-strength codes sound immediately before homing and never
+	; inhibit it: eight low beeps for ML, ten for MH. In the impossible event that
+	; both flags are set, report both codes with a longer separator.
+index_as5600_warn_status:
+		lds	temp1, index_as5600_status
+		sbrs	temp1, INDEX_AS5600_STATUS_ML
+		rjmp	index_as5600_warn_high
+		ldi	YL, INDEX_WARN_MAGNET_LOW
+		rcall	index_as5600_warning_beeps
+		lds	temp1, index_as5600_status
+		sbrs	temp1, INDEX_AS5600_STATUS_MH
+		ret
+		rcall	wait240ms
+index_as5600_warn_high:
+		lds	temp1, index_as5600_status
+		sbrs	temp1, INDEX_AS5600_STATUS_MH
+		ret
+		ldi	YL, INDEX_WARN_MAGNET_HIGH
+index_as5600_warning_beeps:
+		rcall	beep_f1
+		dec	YL
+		breq	index_as5600_warning_done
+		rcall	wait30ms
+		rjmp	index_as5600_warning_beeps
+index_as5600_warning_done:
+		rcall	switch_power_off
 		ret
 
 	; Homing uses its fixed safe pulse width. The continuous PI result directly
