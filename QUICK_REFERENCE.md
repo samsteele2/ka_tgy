@@ -6,7 +6,7 @@ details and firmware settings, see [README.md](README.md).
 ## What the system does
 
 The ESC runs the motor normally while throttle is applied. After the motor has
-run and throttle returns to zero, it waits about five seconds for the rotor to
+run and throttle returns to zero, it waits about three seconds for the rotor to
 coast. It then moves the rotor slowly to the stored home position.
 
 The homing target moves at about 15 rotor RPM. Homing stops when the rotor is at
@@ -65,7 +65,7 @@ accepted.
 1. Begin with a valid zero-throttle command and power the ESC normally.
 2. Operate the motor as a conventional ESC.
 3. After the motor has run, return throttle to zero.
-4. Expect approximately five seconds of unpowered coasting.
+4. Expect approximately three seconds of unpowered coasting.
 5. Keep clear while the rotor slews slowly to home. An approximately 1 kHz tone
    from the audible-rate sine-weighted voltage-vector interpolation is expected.
 6. The ESC turns off when the rotor reaches home and settles.

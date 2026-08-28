@@ -37,8 +37,10 @@ service calibration or positioning at zero throttle.
 2. Arm and run as a conventional SimonK ESC.
 3. A nonzero command arms one future index cycle. Power-up at zero throttle
    cannot start indexing.
-4. On return to zero throttle, turn the bridge off and coast for
-   `INDEX_START_DELAY_SECONDS`.
+4. On return to zero throttle, turn the bridge off. Coast for
+   `INDEX_HOME_DELAY_MS` when the stored electrical record is valid, or
+   `INDEX_CALIBRATION_DELAY_MS` when a new electrical calibration is required.
+   Both checked-in delays are 3000 ms.
 5. Read the AS5600. Abort with the bridge off if the sensor or stored home is
    invalid.
 6. If the electrical record is invalid, align encoder direction and electrical
@@ -289,7 +291,8 @@ User-facing settings are in `ka_nfet.inc`:
 |---|---|
 | `INDEX_ENABLE` | Compile AS5600 indexing. |
 | `INDEX_DRIVE_ENABLE` | Set to 0 for sensor-only commissioning. |
-| `INDEX_START_DELAY_SECONDS` | All-off coast time after zero throttle. |
+| `INDEX_HOME_DELAY_MS` | All-off coast time before normal homing, in milliseconds. |
+| `INDEX_CALIBRATION_DELAY_MS` | All-off coast time before electrical calibration, in milliseconds. |
 | `INDEX_POLE_PAIRS` | Rotor pole-pair count. Use 7 for a standard 12N14P motor. |
 | `INDEX_FOC_UPDATE_HZ` | Sine-weighted space-vector interpolation rate; must divide 20 kHz. |
 | `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
@@ -317,8 +320,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6424 application bytes and 118 bytes of SRAM,
-leaving 744 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6454 application bytes and 120 bytes of SRAM,
+leaving 714 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

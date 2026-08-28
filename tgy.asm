@@ -252,7 +252,8 @@
 ; Index-mode implementation constants. The board file deliberately exposes
 ; only enable/commissioning, controller, and electrical safety settings.
 .equ	INDEX_CONTROL_PERIOD_US = 4096
-.equ	INDEX_DELAY_OVF = (INDEX_START_DELAY_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
+.equ	INDEX_HOME_DELAY_TICKS = (INDEX_HOME_DELAY_MS * 1000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
+.equ	INDEX_CALIBRATION_DELAY_TICKS = (INDEX_CALIBRATION_DELAY_MS * 1000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 .equ	INDEX_HOME_TIMEOUT_TICKS = (INDEX_HOME_TIMEOUT_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 ; Q8 mechanical counts/update. For the fixed 4096 us service period this is
 ; rpm * 4096 counts/rev * 4096 us/update * 256 / 60,000,000 us/min.
@@ -260,8 +261,11 @@
 .equ	INDEX_HOME_SLEW_STEP_COUNTS = INDEX_HOME_SLEW_STEP_Q8 / 256
 .equ	INDEX_HOME_SLEW_STEP_FRACTION = low(INDEX_HOME_SLEW_STEP_Q8)
 .equ	INDEX_HOME_MAX_LEAD_COUNTS = (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES * 4096 + 180) / 360
-.if (INDEX_START_DELAY_SECONDS < 1) || (INDEX_START_DELAY_SECONDS > 30)
-.error "INDEX_START_DELAY_SECONDS must be in the range 1..30"
+.if (INDEX_HOME_DELAY_MS < 0) || (INDEX_HOME_DELAY_MS > 60000)
+.error "INDEX_HOME_DELAY_MS must be in the range 0..60000 milliseconds"
+.endif
+.if (INDEX_CALIBRATION_DELAY_MS < 0) || (INDEX_CALIBRATION_DELAY_MS > 60000)
+.error "INDEX_CALIBRATION_DELAY_MS must be in the range 0..60000 milliseconds"
 .endif
 .if (INDEX_HOME_SLEW_RPM < 1) || (INDEX_HOME_SLEW_RPM > 120)
 .error "INDEX_HOME_SLEW_RPM must be in the range 1..120 mechanical RPM"
@@ -522,6 +526,8 @@ i2c_blc_offset:	.byte	1
 index_state:	.byte	1	; Post-run index state bits (definitions below)
 index_wait_l:	.byte	1	; 4.096 ms Timer1-overflow ticks since throttle went low
 index_wait_h:	.byte	1
+index_delay_l:	.byte	1	; Selected homing/calibration delay in overflow ticks
+index_delay_h:	.byte	1
 index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
 index_angle_h:	.byte	1
 index_target_l: .byte 1	; Slewed mechanical position demand, 0..4095
@@ -3610,6 +3616,18 @@ index_stop_enter:
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
 		out	TWCR, ZH
+		; Select the coast delay once at the falling-throttle transition. A valid
+		; electrical record leads directly to homing; an invalid record requires
+		; the independently tunable electrical-calibration delay.
+		rcall	index_electrical_is_valid
+		brcs	index_stop_calibration_delay
+		ldi2	temp1, temp2, INDEX_HOME_DELAY_TICKS
+		rjmp	index_stop_delay_store
+index_stop_calibration_delay:
+		ldi2	temp1, temp2, INDEX_CALIBRATION_DELAY_TICKS
+index_stop_delay_store:
+		sts	index_delay_l, temp1
+		sts	index_delay_h, temp2
 		ret
 
 	; Called only after evaluate_rc returned a valid zero-duty command. Before
@@ -3623,8 +3641,10 @@ index_poll:	lds	temp1, index_state
 		ret
 		lds	temp1, index_wait_l
 		lds	temp2, index_wait_h
-		cpi	temp1, low(INDEX_DELAY_OVF)
-		sbci	temp2, high(INDEX_DELAY_OVF)
+		lds	temp3, index_delay_l
+		lds	temp4, index_delay_h
+		cp	temp1, temp3
+		cpc	temp2, temp4
 		brcs	index_poll_ret
 		rcall	index_as5600_read
 		brcs	index_sensor_fault
