@@ -66,7 +66,8 @@ accepted.
 2. Operate the motor as a conventional ESC.
 3. After the motor has run, return throttle to zero.
 4. Expect approximately five seconds of unpowered coasting.
-5. Keep clear while the rotor slews slowly to home.
+5. Keep clear while the rotor slews slowly to home. An approximately 1 kHz tone
+   from the audible-rate sine-weighted voltage-vector interpolation is expected.
 6. The ESC turns off when the rotor reaches home and settles.
 
 Powering up at zero throttle does not initiate homing by itself. The motor must

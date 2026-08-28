@@ -275,6 +275,9 @@
 .if (INDEX_POLE_PAIRS < 1) || (INDEX_POLE_PAIRS > 20)
 .error "INDEX_POLE_PAIRS must be in the range 1..20"
 .endif
+.if (INDEX_FOC_UPDATE_HZ < 100) || (INDEX_FOC_UPDATE_HZ > 2000)
+.error "INDEX_FOC_UPDATE_HZ must be in the range 100..2000 Hz"
+.endif
 .equ	INDEX_SETTLE_DELTA = 2		; Maximum motion on terminal release
 .equ	INDEX_TRACK_I_SHIFT = 5
 .equ	INDEX_DENSITY_MAX = 255
@@ -326,6 +329,10 @@
 .if F_CPU % INDEX_PWM_CARRIER_HZ
 .error "INDEX_PWM_CARRIER_HZ must divide F_CPU exactly"
 .endif
+.if INDEX_PWM_CARRIER_HZ % INDEX_FOC_UPDATE_HZ
+.error "INDEX_FOC_UPDATE_HZ must divide the 20 kHz index carrier exactly"
+.endif
+.equ	INDEX_FOC_UPDATE_DIVIDER = INDEX_PWM_CARRIER_HZ / INDEX_FOC_UPDATE_HZ
 .if INDEX_CAL_DUTY_MAX >= INDEX_PWM_PERIOD_CYCLES
 .error "Index calibration duty must be shorter than the indexing PWM period"
 .endif
@@ -527,7 +534,14 @@ index_electrical_h: .byte 1
 index_voltage_l: .byte 1	; Requested q-axis voltage-vector angle, 0..4095
 index_voltage_h: .byte 1
 index_q_command: .byte 1	; Calibrated vector direction: -1, 0, or +1
-index_vector_sector: .byte 1	; Nearest six-step active vector, 0..5
+index_vector_sector: .byte 1	; SVM-selected active vector, 0..5
+index_foc_base_vector: .byte 1 ; Lower active vector surrounding voltage angle
+index_foc_next_weight: .byte 1 ; Sine-weighted following-vector dwell, 0..221
+index_foc_active_scale: .byte 1 ; Combined active dwell, 221..255
+index_foc_accumulator: .byte 1 ; Error-diffusion dwell accumulator
+index_foc_magnitude: .byte 1 ; Unsigned PI request, 0..255 circular magnitude
+index_foc_divider: .byte 1	; 20 kHz frames since last vector update
+index_foc_due: .byte 1	; Main-loop request for an audible-rate vector update
 index_pwm_vector: .byte 1	; Energized vector 0..5, or 0xff when off
 index_pwm_density: .byte 1	; Requested pulse density, 0..255
 index_pwm_accumulator: .byte 1 ; First-order deterministic density accumulator
@@ -1674,13 +1688,29 @@ index_pwm_density_on:
 		rjmp	pwm_again
 		wdr
 		in	i_sreg, SREG
+		lds	i_temp1, index_foc_divider
+		inc	i_temp1
+		cpi	i_temp1, INDEX_FOC_UPDATE_DIVIDER
+		brlo	index_pwm_foc_divider_store
+		clr	i_temp1
+		ldi	i_temp2, 1
+		sts	index_foc_due, i_temp2
+index_pwm_foc_divider_store:
+		sts	index_foc_divider, i_temp1
 		lds	i_temp1, index_pwm_accumulator
 		lds	i_temp2, index_pwm_density
-		cpi	i_temp2, 0xff		; Maximum command emits on every carrier frame
-		breq	index_pwm_density_emit
 		add	i_temp1, i_temp2
+		brcs	index_pwm_density_wrap
+		cpi	i_temp1, 0xff		; Modulo 255 makes density/255 exact
+		breq	index_pwm_density_exact
 		sts	index_pwm_accumulator, i_temp1
-		brcc	index_pwm_density_skip
+		rjmp	index_pwm_density_skip
+index_pwm_density_wrap:
+		inc	i_temp1		; Carry plus low byte is sum minus 255
+		sts	index_pwm_accumulator, i_temp1
+		rjmp	index_pwm_density_emit
+index_pwm_density_exact:
+		sts	index_pwm_accumulator, ZH
 index_pwm_density_emit:
 		out	SREG, i_sreg
 		sbrc	flags2, A_FET
@@ -3476,6 +3506,7 @@ i2c_init:
 index_disarm:	sts	index_state, ZH
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
+		rcall	index_foc_reset
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
@@ -3562,6 +3593,7 @@ index_run_enter:
 		sts	index_state, temp1
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
+		rcall	index_foc_reset
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
@@ -3602,6 +3634,7 @@ index_poll:	lds	temp1, index_state
 		brcc	index_home_begin
 		rjmp	index_calibration_start
 index_home_begin:
+		rcall	index_foc_reset
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_CALIBRATING)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_TARGET_AT_HOME)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)
@@ -3649,12 +3682,25 @@ index_home_missing:
 		rcall	beep_f1
 		ret
 
-	; Timer1 requests this service every 4096 us while indexing is active.
-	; Throttle evaluation runs before this routine, so a new power command wins.
+	; Timer1 requests AS5600/control work every 4096 us. During homing, Timer2 also
+	; requests audible-rate SVM vector updates between encoder samples. Throttle
+	; evaluation runs before this routine, so a new power command always wins.
 index_service:
 		lds	temp1, index_state
 		sbrs	temp1, INDEX_ACTIVE
 		ret
+		sbrc	temp1, INDEX_CALIBRATING
+		rjmp	index_service_control
+		lds	temp2, index_foc_due
+		tst	temp2
+		breq	index_service_control
+		sts	index_foc_due, ZH
+		rcall	index_foc_vector_step
+		.if INDEX_DRIVE_ENABLE
+		rcall	index_six_step_update
+		.endif
+index_service_control:
+		lds	temp1, index_state
 		sbrs	temp1, INDEX_CONTROL_DUE
 		ret
 		andi	temp1, 0xff-(1<<INDEX_CONTROL_DUE)
@@ -3750,20 +3796,13 @@ index_pi_settled:
 		rcall	index_home_complete
 		ret
 
-	; Keep the stored target inside one configured electrical-angle lead of the
-	; measured rotor. A sudden external displacement beyond the bound reanchors the
-	; trajectory at the rotor; ordinary resistance simply pauses further advance.
+	; Limit only new trajectory advance to the configured electrical-angle lead.
+	; Never reanchor an existing target to the measured rotor: doing so drops the
+	; restoring command to zero whenever encoder motion or jitter crosses the lead
+	; boundary, causing a repeating build-and-release torque cycle under load.
 index_target_update:
 		lds	XL, index_target_l
 		lds	XH, index_target_h
-		rcall	index_target_lead_valid
-		brcc	index_target_current_valid
-		lds	XL, index_angle_l
-		lds	XH, index_angle_h
-		sts	index_target_l, XL
-		sts	index_target_h, XH
-		sts	index_target_fraction, ZH
-index_target_current_valid:
 		lds	temp3, index_home_l
 		lds	temp4, index_home_h
 		sub	temp3, XL
@@ -3959,8 +3998,9 @@ index_pi_sum_positive:
 index_pi_sum_done:
 		movw	temp3, XL
 
-	; Convert the continuous signed PI result directly to pulse density. There is
-	; no learned minimum, stall timer, dead-zone inversion, or breakaway pulse.
+	; Convert the continuous signed PI result to circular voltage magnitude. The
+	; sine-weighted SVM stage converts it to angle-dependent pulse density. There
+	; is no learned minimum, stall timer, dead-zone inversion, or breakaway pulse.
 		clr	YL			; YL = command sign flag
 		sbrs	temp4, 7
 		rjmp	index_pi_magnitude
@@ -3981,7 +4021,7 @@ index_pi_magnitude:
 index_pi_density_capped:
 		ldi	temp1, INDEX_DENSITY_MAX
 index_pi_density_store:
-		sts	index_pwm_density, temp1
+		sts	index_foc_magnitude, temp1
 		ldi	temp3, 1
 		tst	YL
 		breq	index_pi_encoder_direction
@@ -3996,6 +4036,7 @@ index_pi_store:
 		rjmp	index_position_electrical
 
 index_pi_zero:
+		sts	index_foc_magnitude, ZH
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rjmp	index_position_electrical
@@ -4125,9 +4166,10 @@ index_voltage_store:
 		rcall	index_angle_to_vector
 		ret
 
-	; Reduce the voltage angle to the nearest of six active vectors. Rounding
-	; at half a 683-count sector provides conventional sensored six-step
-	; commutation while the AS5600 supplies the rotor angle.
+	; Reduce the q-axis voltage angle to its two surrounding active vectors.
+	; A 0.7-degree lookup table supplies sine-weighted SVM dwell values. The
+	; combined active dwell rises from sin(60 degrees) at a sector boundary to
+	; one at mid-sector, keeping the synthesized vector on the inscribed circle.
 index_angle_to_vector:
 		clr	temp3
 index_sector_loop:
@@ -4143,19 +4185,95 @@ index_sector_sub:
 		cpi	temp3, 5
 		brlo	index_sector_loop
 index_sector_done:
-		cpi	temp2, high(342)
-		brlo	index_sector_rounded
-		brne	index_sector_round_up
-		cpi	temp1, low(342)
-		brlo	index_sector_rounded
-index_sector_round_up:
+		sts	index_foc_base_vector, temp3
+		movw	XL, temp1
+		lsr	XH			; 0..682 remainder / 8 = table index 0..85
+		ror	XL
+		lsr	XH
+		ror	XL
+		lsr	XH
+		ror	XL
+		lsl	XL			; Two bytes per table entry
+		rol	XH
+		in	temp4, SREG
+		cli				; ZL is the live Timer2 ISR dispatch pointer
+		push	ZL
+		ldi	ZL, low(index_foc_sine_table << 1)
+		ldi	ZH, high(index_foc_sine_table << 1)
+		add	ZL, XL
+		adc	ZH, XH
+		lpm	temp1, Z+		; Following-vector sine weight
+		lpm	temp2, Z		; Sum of both active-vector weights
+		pop	ZL
+		clr	ZH
+		out	SREG, temp4
+		sts	index_foc_next_weight, temp1
+		sts	index_foc_active_scale, temp2
+		rcall	index_foc_vector_step
+		ret
+
+	; Error-diffuse the sine-weighted following-vector dwell at the 1 kHz SVM
+	; rate. The 20 kHz PDM density is simultaneously scaled by T1+T2, producing
+	; T1=Q*sin(60-alpha), T2=Q*sin(alpha), and a zero-vector remainder.
+index_foc_vector_step:
+		lds	temp3, index_foc_base_vector
+		lds	XL, index_foc_accumulator
+		lds	temp1, index_foc_next_weight
+		lds	temp2, index_foc_active_scale
+		cp	XL, temp2		; Normalize after a small table-scale change
+		brlo	index_foc_accumulator_normal
+		sub	XL, temp2
+index_foc_accumulator_normal:
+		add	XL, temp1
+		brcs	index_foc_vector_wrap
+		cp	XL, temp2
+		brlo	index_foc_vector_store
+		sub	XL, temp2
+		rjmp	index_foc_vector_next
+index_foc_vector_wrap:
+		sub	XL, temp2		; Low byte of (sum - active scale)
+index_foc_vector_next:
 		inc	temp3
 		cpi	temp3, 6
-		brlo	index_sector_rounded
+		brlo	index_foc_vector_store
 		clr	temp3
-index_sector_rounded:
+index_foc_vector_store:
+		sts	index_foc_accumulator, XL
 		sts	index_vector_sector, temp3
+
+	; Round magnitude*active_scale/255. The modulo-255 carrier accumulator makes
+	; this density scale exact, including command 255 at the sector midpoint.
+		lds	temp1, index_foc_magnitude
+		mul	temp1, temp2
+		mov	temp1, temp5
+		mov	temp2, temp6
+		subi	temp1, low(-127)	; Add half a divisor before /255
+		sbci	temp2, high(-127)
+		add	temp1, temp2		; n/255 = high(n) + (high+low >= 255)
+		brcs	index_foc_density_round_up
+		cpi	temp1, 0xff
+		brne	index_foc_density_store
+index_foc_density_round_up:
+		inc	temp2
+index_foc_density_store:
+		sts	index_pwm_density, temp2
 		ret
+
+	; Pairs are {following-vector weight, T1+T2}, sampled every eight of the
+	; 683 encoder counts in one electrical sector. Command 255 therefore traces
+	; the largest constant-radius circle inside the six active-vector hexagon.
+index_foc_sine_table:
+		.db	0, 221, 3, 222, 6, 224, 9, 225, 13, 227, 16, 228, 19, 230, 22, 231
+		.db	25, 232, 28, 234, 31, 235, 34, 236, 37, 237, 40, 238, 44, 239, 47, 240
+		.db	50, 241, 53, 242, 56, 243, 59, 244, 62, 245, 65, 246, 68, 247, 71, 248
+		.db	74, 248, 77, 249, 80, 250, 83, 250, 86, 251, 89, 251, 92, 252, 94, 252
+		.db	98, 253, 100, 253, 103, 254, 106, 254, 109, 254, 112, 254, 115, 255, 118, 255
+		.db	120, 255, 123, 255, 126, 255, 128, 255, 131, 255, 134, 255, 136, 255, 139, 255
+		.db	141, 254, 144, 254, 147, 254, 150, 254, 152, 253, 154, 253, 157, 253, 159, 252
+		.db	162, 252, 164, 251, 167, 251, 169, 250, 171, 249, 174, 249, 176, 248, 178, 247
+		.db	180, 246, 183, 246, 185, 245, 187, 244, 189, 243, 191, 242, 193, 241, 195, 240
+		.db	197, 239, 199, 238, 201, 236, 203, 235, 205, 234, 207, 233, 208, 231, 210, 230
+		.db	212, 229, 213, 227, 215, 226, 217, 224, 219, 223, 220, 221
 
 	; Home is a terminal state for this stopped cycle. Keep only the post-run
 	; armed latch; a later accepted throttle command starts normal SimonK and
@@ -4164,6 +4282,7 @@ index_home_complete:
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rcall	switch_power_off
+		rcall	index_foc_reset
 		cbr	flags2, (1<<INDEX_DENSITY_PWM)
 		sts	index_previous_error_l, ZH
 		sts	index_previous_error_h, ZH
@@ -4175,6 +4294,16 @@ index_home_complete:
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
 		out	TWCR, ZH
+		ret
+
+index_foc_reset:
+		sts	index_foc_base_vector, ZH
+		sts	index_foc_next_weight, ZH
+		sts	index_foc_active_scale, ZH
+		sts	index_foc_accumulator, ZH
+		sts	index_foc_magnitude, ZH
+		sts	index_foc_divider, ZH
+		sts	index_foc_due, ZH
 		ret
 
 	; Five low pulses uniquely report that the rotor did not satisfy the normal
@@ -4943,7 +5072,8 @@ index_six_step_rise_delay:
 		ldi	ZL, low(pwm_on)
 		rjmp	index_six_step_start_timer
 index_six_step_start_density:
-		sts	index_pwm_accumulator, ZH
+		; Preserve pulse-density phase across SVM vector transitions. It is reset
+		; once at homing/alignment entry, not at every adjacent-vector commute.
 		ldi	ZL, low(index_pwm_density_on)
 index_six_step_start_timer:
 		mov	tcnt2h, ZH

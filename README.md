@@ -11,7 +11,7 @@ For installation, normal operation, and fault-code checks, see
 > current-limited supply, begin below flight voltage, inspect all six gate
 > waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
 > limits each calibration pulse to 8.0 us. Calibration emits at most one pulse
-> at 77/256 density (approximately 6.0 kHz effective, 4.8% average duty); this is not a
+> at 77/255 density (approximately 6.0 kHz effective, 4.8% average duty); this is not a
 > phase-current limit.
 
 ## System overview
@@ -22,8 +22,8 @@ For installation, normal operation, and fault-code checks, see
 | Normal drive | SimonK sensorless six-step commutation |
 | Command | RC PWM on PD2/INT0; legacy SimonK I2C is retained |
 | Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
-| Index update | 4.096 ms / 244.14 Hz |
-| Index drive | Sensored six-step; 20 kHz homing PDM, 6 kHz calibration pulses |
+| Position/encoder update | 4.096 ms / 244.14 Hz |
+| Index drive | Voltage-mode sensored FOC; 1 kHz two-vector SVM, 20 kHz homing PDM |
 | Persistent data | Mechanical home and electrical calibration in EEPROM |
 | Firmware image | `ka_nfet.hex` |
 
@@ -77,7 +77,7 @@ the standard 12-slot, 14-pole motor arrangement.
 ## Electrical calibration
 
 Calibration logic runs every 4.096 ms and directly commands a stationary or
-slowly rotating six-step field. The low-side FET receives 77 pulses per 256
+slowly rotating six-step field. The low-side FET receives 77 pulses per 255
 20 kHz carrier frames: approximately 6.0 kHz effective. The selected high-side source remains
 on for the vector, but conducts phase current only during the low-side pulse and
 motor-current decay.
@@ -109,7 +109,7 @@ accumulated phase current, causing excessive supply current and high-side FET
 heating. Hardware testing showed approximately eight times less calibration
 input current after changing to an 8 us pulse every 200 us.
 
-Timer2 still runs at 20 kHz, but calibration emits at 77/256 pulse density.
+Timer2 still runs at 20 kHz, but calibration emits at 77/255 pulse density.
 The resulting approximately 6 kHz winding-current and torque excitation can therefore
 be audible. Restoring an ultrasonic *electrical excitation* is not considered a
 safe timing-only change: it would require substantially shorter pulses, closed-
@@ -134,10 +134,34 @@ Failure behavior:
 
 ## Index power stage
 
-The configured pole count, calibrated encoder direction, and electrical offset convert
-mechanical angle to rotor electrical angle. Controller sign requests positive or
-negative 90-degree electrical torque angle, rounded to the nearest of six active
-vectors.
+The configured pole count, calibrated encoder direction, and electrical offset
+convert mechanical angle to rotor electrical angle. Controller sign requests a
+positive or negative 90-degree electrical q-axis voltage angle. This is
+voltage-mode sensored FOC: there is no phase-current measurement or closed-loop
+d/q current regulator.
+
+The requested voltage angle is decomposed into its two adjacent inverter active
+vectors. A sine-weighted table implements the standard sector dwell law:
+
+```text
+T1 = magnitude * sin(60 degrees - alpha)
+T2 = magnitude * sin(alpha)
+T0 = 1 - T1 - T2
+```
+
+Here, `alpha` is the requested angle inside its 60-degree sector. At
+`INDEX_FOC_UPDATE_HZ`, a first-order dwell accumulator selects between the two
+active vectors in the ratio `T2/(T1+T2)`. The 20 kHz pulse density is multiplied
+by `T1+T2`; unpowered carrier frames supply `T0`. Unlike linear interpolation,
+this traces the largest constant-radius circle inside the inverter voltage
+hexagon. Maximum circular magnitude is therefore 86.6% of a single active-vector
+magnitude. The table is sampled every eight encoder counts (about 0.7 electrical
+degrees), limiting calculated radius error to less than 0.25%.
+
+This space-vector interpolation removes the former 60-electrical-degree angle
+steps and 15.5% hexagonal magnitude envelope. The checked-in 1 kHz rate is
+intentionally audible and bounds worst-case high-side commutation to 1 kHz
+rather than 20 kHz.
 
 Each vector energizes one high-side source and a different phase low-side sink.
 Only the sink is pulsed. A vector transition performs:
@@ -149,10 +173,11 @@ Only the sink is pulsed. A vector transition performs:
 5. start low-side pulses on the sink phase.
 
 With the current configuration, calibration uses fixed 8.0 us low-side pulses
-at approximately 6.0 kHz effective, for 4.8% average applied duty. Homing uses a separate fixed
-3.5 us pulse, and an 8-bit first-order accumulator varies its density from 0 to
-255 frames at a 20 kHz carrier. Zero controller output coasts; indexing never
-applies dynamic braking.
+at approximately 6.0 kHz effective, for 4.8% average applied duty. Homing uses a
+separate fixed 3.5 us pulse, and an 8-bit modulo-255 accumulator varies its
+density from 0 to 255 frames at a 20 kHz carrier. Its accumulator is preserved
+across adjacent-vector commutation so torque magnitude does not restart at every
+SVM update. Zero controller output coasts; indexing never applies dynamic braking.
 
 ## Position-control specification
 
@@ -170,10 +195,12 @@ counts per update for approximately the configured average rate.
 The target is permitted to lead the measured rotor by at most
 `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES`. The checked-in 360-degree limit is
 evaluated using the configured pole-pair count. If the rotor falls behind, the
-target pauses before crossing the limit. If an external displacement has
-already put it outside the limit, the target is reanchored at the measured
-rotor position. This bounds stored trajectory separation after a stick-slip
-event; it is not a rotor-speed controller.
+target pauses before crossing the limit. An already-stored target is never
+reanchored to the measured rotor: doing that would momentarily zero the position
+error and release torque at the limit. External displacement therefore leaves
+the target intact, and the controller continues to apply its limited restoring
+command. The lead limit constrains new trajectory advance; it is not a
+rotor-speed controller.
 
 ### PI law
 
@@ -197,9 +224,11 @@ rotor crosses the moving target. Between crossings, `INDEX_I_MAX` bounds its
 magnitude.
 
 Once the target reaches home, the same law naturally becomes home-position PI
-control. The signed command is saturated to -255 through 255. Its magnitude directly
-sets pulse density and its sign selects torque direction. There is no stall
-counter, dead-zone inversion, learned minimum output, or homing breakaway pulse.
+control. The signed command is saturated to -255 through 255. Its magnitude sets
+the circular q-axis voltage request, and sine-weighted SVM converts that request
+to angle-dependent pulse density. Its sign selects torque direction. There is no
+stall counter, dead-zone inversion, learned minimum output, or homing breakaway
+pulse.
 
 Current checked-in values are:
 
@@ -235,14 +264,14 @@ low beeps.
 
 The controller is substantially simpler, but these behaviors are intentional:
 
-- With P = 0.375, target-tracking errors of approximately 680 counts or more
+- With P = 0.5, target-tracking errors of approximately 510 counts or more
   saturate the proportional output.
 - The integral can still reach its clamp during a saturated approach, although
   crossing the moving target clears it before accumulation begins in the
   opposite direction.
 - There is no derivative term or electronic velocity damping.
-- Output remains quantized by 8-bit pulse density and six 60-degree electrical
-  vectors.
+- Output magnitude remains quantized by 8-bit pulse density. Voltage angle is a
+  sine-weighted time average of adjacent active vectors at `INDEX_FOC_UPDATE_HZ`.
 - The trajectory limits target separation, but there is no direct rotor-speed
   feedback or acceleration controller.
 - The exact 180-degree position error has two equivalent paths; signed wrapping
@@ -262,6 +291,7 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_DRIVE_ENABLE` | Set to 0 for sensor-only commissioning. |
 | `INDEX_START_DELAY_SECONDS` | All-off coast time after zero throttle. |
 | `INDEX_POLE_PAIRS` | Rotor pole-pair count. Use 7 for a standard 12N14P motor. |
+| `INDEX_FOC_UPDATE_HZ` | Sine-weighted space-vector interpolation rate; must divide 20 kHz. |
 | `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
@@ -287,8 +317,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6162 application bytes and 111 bytes of SRAM,
-leaving 1006 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6424 application bytes and 118 bytes of SRAM,
+leaving 744 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

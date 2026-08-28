@@ -25,15 +25,16 @@
 .equ	INDEX_DRIVE_ENABLE		= 1	; Set to 0 for sensor-only commissioning
 .equ	INDEX_START_DELAY_SECONDS = 5	; Coast time after throttle reaches zero
 .equ	INDEX_POLE_PAIRS		= 7	; 12N14P motor: 14 rotor poles / 2
+.equ	INDEX_FOC_UPDATE_HZ		= 1000	; Sine-weighted SVM interpolation rate
 
 ; Slewed-target position controller. P and I are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is
 ; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
-.equ	INDEX_P_GAIN			= 8
-.equ	INDEX_I_GAIN			= 4
-.equ	INDEX_I_MAX				= 24576
-.equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 3 degrees from home
-.equ	INDEX_HOME_SLEW_RPM		= 15	; Mechanical target speed toward home
+.equ	INDEX_P_GAIN			= 24
+.equ	INDEX_I_GAIN			= 2
+.equ	INDEX_I_MAX				= 16384
+.equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 180 = 3 degrees from home
+.equ	INDEX_HOME_SLEW_RPM		= 30	; Mechanical target speed toward home
 .equ	INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES = 360 ; Target-to-rotor safety bound
 .equ	INDEX_HOME_TIMEOUT_SECONDS = 8	; Abort incomplete homing with five low beeps
 .equ	INDEX_CAL_NOISE_DELTA	= 3	; Electrical-calibration encoder-noise threshold
