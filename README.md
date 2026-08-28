@@ -46,7 +46,7 @@ service calibration or positioning at zero throttle.
 6. If the electrical record is invalid, align encoder direction and electrical
    zero using the configured motor pole count, then commit the result.
 7. Initialize the position target at the measured rotor angle, slew it toward
-   mechanical home, and run the PI controller against that moving target.
+   mechanical home, and run the PID controller against that moving target.
 8. After the target reaches home, turn the complete bridge off when position
    and motion are within tolerance. Abort after eight seconds if it cannot settle.
 
@@ -190,8 +190,8 @@ sample-to-sample motion are wrapped to the signed range -2048 to 2047.
 
 At index start, the demanded position is initialized to the measured rotor
 angle. It then follows the shortest mechanical path toward home at
-`INDEX_HOME_SLEW_RPM`. At the checked-in 15 RPM setting and 4.096 ms update
-period, a fractional accumulator advances the target by four or five AS5600
+`INDEX_HOME_SLEW_RPM`. At the configured 60 RPM setting and 4.096 ms update
+period, a fractional accumulator advances the target by 16 or 17 AS5600
 counts per update for approximately the configured average rate.
 
 The target is permitted to lead the measured rotor by at most
@@ -204,43 +204,48 @@ the target intact, and the controller continues to apply its limited restoring
 command. The lead limit constrains new trajectory advance; it is not a
 rotor-speed controller.
 
-### PI law
+### PID law
 
 Every 4.096 ms:
 
 ```text
 error[k] = wrapped(target[k] - position[k])
+velocity[k] = wrapped(position[k] - position[k-1])
 if error[k] crossed zero:
     integral[k-1] = 0
 integral[k] = clamp(integral[k-1] + error[k], -I_MAX, I_MAX)
 
 u = trunc(P * error[k])
   + trunc(I * trunc(integral[k] / 32))
+  - trunc(D * velocity[k])
 ```
 
-P and I are configured in sixteenths. Integral action runs on every control
+P, I, and D are configured in sixteenths. D acts on measured rotor movement
+rather than the change in moving-target error, preventing target-slew derivative
+kick. Integral action runs on every control
 update, including while output is saturated and while the rotor is moving. The
 accumulator is cleared when the signed position error changes sign or is exactly
 zero, preventing stored torque from continuing in the old direction after the
 rotor crosses the moving target. Between crossings, `INDEX_I_MAX` bounds its
 magnitude.
 
-Once the target reaches home, the same law naturally becomes home-position PI
+Once the target reaches home, the same law naturally becomes home-position PID
 control. The signed command is saturated to -255 through 255. Its magnitude sets
 the circular q-axis voltage request, and sine-weighted SVM converts that request
 to angle-dependent pulse density. Its sign selects torque direction. There is no
 stall counter, dead-zone inversion, learned minimum output, or homing breakaway
 pulse.
 
-Current checked-in values are:
+Current configured values are:
 
 | Setting | Value | Effective behavior |
 |---|---:|---|
-| `INDEX_P_GAIN` | 8 | P = 0.5 |
-| `INDEX_I_GAIN` | 4 | I = 0.25 |
-| `INDEX_I_MAX` | 24576 | Symmetric integral-accumulator clamp |
+| `INDEX_P_GAIN` | 12 | P = 0.75 |
+| `INDEX_I_GAIN` | 2 | I = 0.125 |
+| `INDEX_D_GAIN` | 8 | D = 0.5 per measured encoder count/update |
+| `INDEX_I_MAX` | 16384 | Symmetric integral-accumulator clamp |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
-| `INDEX_HOME_SLEW_RPM` | 15 | Mechanical target slew rate |
+| `INDEX_HOME_SLEW_RPM` | 60 | Mechanical target slew rate |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | 360 | Maximum target-to-rotor separation |
 | `INDEX_HOME_TIMEOUT_SECONDS` | 8 | Maximum homing duration |
 
@@ -266,12 +271,14 @@ low beeps.
 
 The controller is substantially simpler, but these behaviors are intentional:
 
-- With P = 0.5, target-tracking errors of approximately 510 counts or more
+- With P = 0.75, target-tracking errors of approximately 340 counts or more
   saturate the proportional output.
 - The integral can still reach its clamp during a saturated approach, although
   crossing the moving target clears it before accumulation begins in the
   opposite direction.
-- There is no derivative term or electronic velocity damping.
+- D uses one raw wrapped AS5600 sample delta. Gain 8 suppresses a one-count
+  change through fixed-point truncation, but larger encoder noise appears in the
+  damping command.
 - Output magnitude remains quantized by 8-bit pulse density. Voltage angle is a
   sine-weighted time average of adjacent active vectors at `INDEX_FOC_UPDATE_HZ`.
 - The trajectory limits target separation, but there is no direct rotor-speed
@@ -280,8 +287,9 @@ The controller is substantially simpler, but these behaviors are intentional:
   selects one.
 - Position control uses a fixed safe pulse width but has no current feedback.
 
-Tune P first, then introduce I only as needed to overcome steady position error.
-Use `INDEX_I_MAX` to bound the maximum stored integral torque.
+Tune P first, increase D to remove overshoot, then introduce I only as needed to
+overcome steady position error. Use `INDEX_I_MAX` to bound the maximum stored
+integral torque.
 
 ## User configuration
 
@@ -295,7 +303,7 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_CALIBRATION_DELAY_MS` | All-off coast time before electrical calibration, in milliseconds. |
 | `INDEX_POLE_PAIRS` | Rotor pole-pair count. Use 7 for a standard 12N14P motor. |
 | `INDEX_FOC_UPDATE_HZ` | Sine-weighted space-vector interpolation rate; must divide 20 kHz. |
-| `INDEX_P_GAIN`, `INDEX_I_GAIN` | Controller gains in sixteenths. |
+| `INDEX_P_GAIN`, `INDEX_I_GAIN`, `INDEX_D_GAIN` | Controller gains in sixteenths. D damps measured rotor motion. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
 | `INDEX_HOME_SLEW_RPM` | Mechanical target slew rate toward home. |
@@ -320,8 +328,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6454 application bytes and 120 bytes of SRAM,
-leaving 714 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6504 application bytes and 120 bytes of SRAM,
+leaving 664 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

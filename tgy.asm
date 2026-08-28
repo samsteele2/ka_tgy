@@ -293,6 +293,9 @@
 .if (INDEX_I_GAIN < 0) || (INDEX_I_GAIN > 255)
 .error "INDEX_I_GAIN must be in the range 0..255 (gain in sixteenths)"
 .endif
+.if (INDEX_D_GAIN < 0) || (INDEX_D_GAIN > 255)
+.error "INDEX_D_GAIN must be in the range 0..255 (gain in sixteenths)"
+.endif
 .if (INDEX_I_MAX < 1) || (INDEX_I_MAX > 28672)
 .error "INDEX_I_MAX must be in the range 1..28672"
 .endif
@@ -551,7 +554,7 @@ index_foc_due: .byte 1	; Main-loop request for an audible-rate vector update
 index_pwm_vector: .byte 1	; Energized vector 0..5, or 0xff when off
 index_pwm_density: .byte 1	; Requested pulse density, 0..255
 index_pwm_accumulator: .byte 1 ; First-order deterministic density accumulator
-index_previous_angle_l: .byte 1 ; Previous AS5600 angle for terminal motion test
+index_previous_angle_l: .byte 1 ; Previous AS5600 angle for D and terminal test
 index_previous_angle_h: .byte 1
 index_previous_error_l: .byte 1 ; Previous signed target error for zero-cross reset
 index_previous_error_h: .byte 1
@@ -3738,8 +3741,8 @@ index_service_control:
 		.endif
 		ret
 
-	; Advance a mechanical target at the configured rate, then let the unchanged
-	; PI law track that target. Homing has its own elapsed-time watchdog.
+	; Advance a mechanical target at the configured rate, then let the PID law
+	; track that target. Homing has its own elapsed-time watchdog.
 index_position_step:
 		lds	temp1, index_home_ticks_l
 		lds	temp2, index_home_ticks_h
@@ -3765,7 +3768,8 @@ index_position_within_time:
 		ori	temp4, 0xf0		; Sign-extend the 12-bit difference
 		movw	XL, temp3		; X = signed target-minus-position error
 
-	; Raw signed rotor delta is used only for the terminal low-motion test.
+	; Raw signed rotor delta supplies both terminal motion qualification and the
+	; derivative damping term. It is independent of moving-target velocity.
 		lds	temp3, index_angle_l
 		lds	temp4, index_angle_h
 		lds	temp1, index_previous_angle_l
@@ -3930,6 +3934,14 @@ index_target_lead_invalid:
 		ret
 
 index_pi_continue:
+	; D acts on measured rotor motion, not error change, so target slew cannot
+	; create a derivative kick. Preserve the scaled result across the P/I work.
+		movw	temp1, temp3
+		ldi	temp3, INDEX_D_GAIN
+		rcall	index_pi_signed_scale_q4
+		push	temp1
+		push	temp2
+
 	; Clear stored integral whenever the signed error crosses zero. Exact zero also
 	; clears it, preventing residual torque while the rotor passes through target.
 		lds	temp1, index_previous_error_l
@@ -4016,9 +4028,34 @@ index_pi_sum_positive:
 		ldi	XL, 0xff
 		ldi	XH, 0x7f
 index_pi_sum_done:
+	; Subtract measured-motion damping with signed saturation. Overflow is possible
+	; only when the P+I command and D term have opposite signs.
+		pop	temp2
+		pop	temp1
+		mov	YL, XH			; Preserve the P+I sign
+		sub	XL, temp1
+		sbc	XH, temp2
+		mov	temp3, YL
+		eor	temp3, temp2
+		sbrs	temp3, 7
+		rjmp	index_pid_d_no_overflow
+		mov	temp3, YL
+		eor	temp3, XH
+		sbrs	temp3, 7
+		rjmp	index_pid_d_no_overflow
+		sbrs	YL, 7
+		rjmp	index_pid_d_positive_overflow
+		clr	XL
+		ldi	XH, 0x80
+		rjmp	index_pid_d_done
+index_pid_d_positive_overflow:
+		ldi	XL, 0xff
+		ldi	XH, 0x7f
+index_pid_d_no_overflow:
+index_pid_d_done:
 		movw	temp3, XL
 
-	; Convert the continuous signed PI result to circular voltage magnitude. The
+	; Convert the continuous signed PID result to circular voltage magnitude. The
 	; sine-weighted SVM stage converts it to angle-dependent pulse density. There
 	; is no learned minimum, stall timer, dead-zone inversion, or breakaway pulse.
 		clr	YL			; YL = command sign flag
