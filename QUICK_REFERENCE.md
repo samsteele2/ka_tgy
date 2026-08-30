@@ -94,7 +94,7 @@ system off before inspecting it.
 
 | Beeps | Meaning | First checks |
 |---:|---|---|
-| 2 | AS5600 communication failure | Check sensor power, ground, SDA/SCL wiring, connectors, and magnet alignment. |
+| 2 | AS5600 communication failure or no detected magnet (`MD = 0`) | Check sensor power, ground, SDA/SCL wiring, connectors, and magnet alignment. The bridge remains off. |
 | 3 | No stored home position | Repeat throttle/home calibration and hold the rotor at the intended home during low-endpoint capture. |
 | 4 | Rotor did not settle during electrical calibration | Check for vibration, loose folding blades, encoder noise, or a rotor that continues rocking. |
 | 5 | Homing did not finish within eight seconds | Check for an obstruction, excessive friction, a slipping propeller assembly, or inability to hold the home position. |

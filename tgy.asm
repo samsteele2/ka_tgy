@@ -313,6 +313,7 @@
 .equ	INDEX_AS5600_RAW_ANGLE_REG = 0x0c
 .equ	INDEX_AS5600_CONF_L = 0x00	; Normal power, no output hysteresis
 .equ	INDEX_AS5600_CONF_H = 0x01	; 8x slow filter, fast filter/watchdog disabled
+.equ	INDEX_AS5600_STATUS_MD = 5	; A magnet is detected
 .equ	INDEX_AS5600_STATUS_MH = 3	; Magnet field strength too high
 .equ	INDEX_AS5600_STATUS_ML = 4	; Magnet field strength too low
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
@@ -3590,6 +3591,8 @@ index_calibrate_home:
 		brcs	index_calibrate_home_invalid
 		rcall	index_as5600_read
 		brcs	index_calibrate_home_invalid
+		rcall	index_as5600_magnet_detected
+		brcs	index_calibrate_home_invalid
 		lds	temp1, index_angle_l
 		lds	temp2, index_angle_h
 		sts	index_home_l, temp1
@@ -3664,6 +3667,8 @@ index_poll:	lds	temp1, index_state
 		brcs	index_sensor_fault
 		rcall	index_as5600_read
 		brcs	index_sensor_fault
+		rcall	index_as5600_magnet_detected
+		brcs	index_sensor_fault
 		rcall	index_home_is_valid
 		brcs	index_home_missing
 		rcall	index_electrical_is_valid
@@ -3674,6 +3679,8 @@ index_home_preflight:
 		; then refresh the raw angle because the tone can move the rotor slightly.
 		rcall	index_as5600_warn_status
 		rcall	index_as5600_read
+		brcs	index_sensor_fault
+		rcall	index_as5600_magnet_detected
 		brcs	index_sensor_fault
 index_home_begin:
 		rcall	index_foc_reset
@@ -3748,6 +3755,8 @@ index_service_control:
 		andi	temp1, 0xff-(1<<INDEX_CONTROL_DUE)
 		sts	index_state, temp1
 		rcall	index_as5600_read
+		brcs	index_sensor_fault
+		rcall	index_as5600_magnet_detected
 		brcs	index_sensor_fault
 		lds	temp1, index_state
 		ori	temp1, (1<<INDEX_ANGLE_VALID)
@@ -4879,11 +4888,19 @@ index_calibration_offset_store:
 		brcc	index_calibration_commit_read_ok
 		rjmp	index_sensor_fault
 index_calibration_commit_read_ok:
+		rcall	index_as5600_magnet_detected
+		brcc	index_calibration_commit_magnet_ok
+		rjmp	index_sensor_fault
+index_calibration_commit_magnet_ok:
 		rcall	index_as5600_warn_status
 		rcall	index_as5600_read
 		brcc	index_calibration_commit_refresh_ok
 		rjmp	index_sensor_fault
 index_calibration_commit_refresh_ok:
+		rcall	index_as5600_magnet_detected
+		brcc	index_calibration_commit_refresh_magnet_ok
+		rjmp	index_sensor_fault
+index_calibration_commit_refresh_magnet_ok:
 		rjmp	index_home_begin
 
 	; Low-beep counts are unique across index-mode failures: two sensor, three
@@ -5097,6 +5114,19 @@ index_as5600_read_address_wait_ok:
 index_as5600_error:
 		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
 		out	TWCR, temp1
+		sec
+		ret
+
+	; A responding AS5600 is not sufficient to command the bridge. MD is the
+	; sensor's magnet-present indication; a clear bit takes the same safe path
+	; as a failed AS5600 transaction.
+index_as5600_magnet_detected:
+		lds	temp1, index_as5600_status
+		sbrs	temp1, INDEX_AS5600_STATUS_MD
+		rjmp	index_as5600_magnet_missing
+		clc
+		ret
+index_as5600_magnet_missing:
 		sec
 		ret
 

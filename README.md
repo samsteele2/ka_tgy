@@ -126,7 +126,7 @@ gate-enhancement concern, not as 20 kHz high-side switching loss.
 
 Failure behavior:
 
-- AS5600 transaction failure: bridge off, two low beeps;
+- AS5600 transaction failure or no detected magnet (`MD = 0`): bridge off, two low beeps;
 - missing mechanical home: bridge off, three low beeps;
 - electrical-calibration settling timeout: bridge off, four low beeps;
 - homing timeout: bridge off, five low beeps;
@@ -142,6 +142,12 @@ All position feedback comes from the 12-bit `RAW ANGLE` registers (`0x0C` and
 `0x0D`), not the scaled `ANGLE` registers. This avoids the `ANGLE` path's range
 scaling and 10-LSB hysteresis at the 0/360-degree boundary. Each read begins at
 `STATUS` (`0x0B`) and receives status plus both raw-angle bytes in one I2C burst.
+
+`MD` is a mandatory safety interlock, not an advisory diagnostic. The firmware
+will not start electrical calibration or homing unless `MD = 1`; if it clears
+during either active sequence, the next 4.096 ms sensor update turns the bridge
+off and emits the normal two-low-beep sensor-fault code. `ML` and `MH` remain
+advisory magnet-strength codes and do not inhibit homing when `MD` is set.
 
 Before mechanical-home capture and before an indexing sequence, firmware writes
 a known volatile AS5600 configuration: normal power mode, output hysteresis off,
