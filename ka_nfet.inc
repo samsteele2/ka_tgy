@@ -26,7 +26,7 @@
 .equ	INDEX_HOME_DELAY_MS		= 3000	; Coast time before normal homing
 .equ	INDEX_CALIBRATION_DELAY_MS = 3000	; Coast time before electrical calibration
 .equ	INDEX_POLE_PAIRS		= 7	; 12N14P motor: 14 rotor poles / 2
-.equ	INDEX_FOC_UPDATE_HZ		= 1000	; Sine-weighted SVM interpolation rate
+.equ	INDEX_FOC_UPDATE_HZ		= 1000	; Timer2-scheduled sine-weighted SVM vector-selection rate
 
 ; Slewed-target position controller. P, I, and D are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is

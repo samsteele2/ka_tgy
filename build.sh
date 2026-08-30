@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the KA nFET firmware on macOS/Linux. Requires AVRA in PATH.
+# Build the KA nFET firmware on macOS/Linux using the KA-only Makefile.
 
 set -euo pipefail
 
@@ -10,11 +10,9 @@ if ! command -v avra >/dev/null 2>&1; then
     exit 1
 fi
 
-(
-    cd "$repo_dir"
-    avra -fI -D ka_nfet_esc -I "$repo_dir" -I "$repo_dir/other_escs" tgy.asm
-    mv -f tgy.hex ka_nfet.hex
-    rm -f tgy.eep.hex tgy.obj tgy.cof
-)
+if ! command -v make >/dev/null 2>&1; then
+    echo "make was not found. Install the macOS Command Line Tools, then run this script again." >&2
+    exit 1
+fi
 
-echo "Built: $repo_dir/ka_nfet.hex"
+exec make -C "$repo_dir" "AVRA=$(command -v avra)"

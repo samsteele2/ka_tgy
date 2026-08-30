@@ -187,9 +187,12 @@ magnitude. The table is sampled every eight encoder counts (about 0.7 electrical
 degrees), limiting calculated radius error to less than 0.25%.
 
 This space-vector interpolation removes the former 60-electrical-degree angle
-steps and 15.5% hexagonal magnitude envelope. The checked-in 1 kHz rate is
-intentionally audible and bounds worst-case high-side commutation to 1 kHz
-rather than 20 kHz.
+steps and 15.5% hexagonal magnitude envelope. Position control publishes updated
+SVM parameters every 4.096 ms, but only the Timer2-derived scheduler selects an
+active vector. Therefore `INDEX_FOC_UPDATE_HZ` is the real recurring vector and
+high-side commutation bound. A zero command turns the bridge off immediately;
+the first nonzero command from a stopped bridge performs one initial selection,
+then begins a full scheduled interval.
 
 Each vector energizes one high-side source and a different phase low-side sink.
 Only the sink is pulsed. A vector transition performs:
@@ -344,7 +347,17 @@ remain private to `tgy.asm`.
 
 ## Build and flash
 
-Build with AVRA:
+This repository has one build target: `ka_nfet.hex`. The Makefile is the
+canonical macOS/Linux development entry point; it intentionally does not build
+historical SimonK boards. `make`, `make build`, and `make test` all assemble
+that one target. `make clean` removes only AVRA intermediates and keeps the
+reviewed HEX image.
+
+```bash
+make
+```
+
+One-click wrappers remain the practical entry point on Windows and macOS:
 
 ```powershell
 .\build.bat
@@ -354,8 +367,8 @@ Build with AVRA:
 ./build.sh
 ```
 
-The current normal build uses 6504 application bytes and 120 bytes of SRAM,
-leaving 664 bytes before the boot section at word address `0x0E00`.
+The current normal build uses 6456 application bytes and 110 bytes of SRAM,
+leaving 712 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:
@@ -371,6 +384,8 @@ fuse `0xCA`, then verify them. They do not rebuild:
 Review the image and fuse values for the exact board before programming.
 
 ## Source map
+
+- `Makefile` — canonical single-target macOS/Linux build definition.
 
 - `tgy.asm` — SimonK base plus AS5600 calibration and position control.
 - `ka_nfet.inc` — PCB pin map and user-facing configuration.

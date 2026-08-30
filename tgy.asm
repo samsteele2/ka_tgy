@@ -3737,9 +3737,10 @@ index_home_missing:
 		rcall	beep_f1
 		ret
 
-	; Timer1 requests AS5600/control work every 4096 us. During homing, Timer2 also
-	; requests audible-rate SVM vector updates between encoder samples. Throttle
-	; evaluation runs before this routine, so a new power command always wins.
+	; Timer1 requests AS5600/control work every 4096 us. During homing, Timer2
+	; exclusively schedules SVM vector selection at INDEX_FOC_UPDATE_HZ; the
+	; control update only publishes new angle/magnitude data for that scheduler.
+	; Throttle evaluation runs before this routine, so a new power command wins.
 index_service:
 		lds	temp1, index_state
 		sbrs	temp1, INDEX_ACTIVE
@@ -3771,7 +3772,7 @@ index_service_control:
 		rjmp	index_calibration_step
 		rcall	index_position_step
 		.if INDEX_DRIVE_ENABLE
-		rcall	index_six_step_update
+		rcall	index_foc_control_apply
 		.endif
 		ret
 
@@ -4300,7 +4301,29 @@ index_sector_done:
 		out	SREG, temp4
 		sts	index_foc_next_weight, temp1
 		sts	index_foc_active_scale, temp2
+		ret
+
+	; Control samples may change the requested voltage vector, but must not add a
+	; second periodic SVM selection path. The only exceptions are immediate coast
+	; at a zero command and the one initial selection needed to start Timer2 from
+	; a stopped bridge. The latter resets the cadence so the next selection is one
+	; full INDEX_FOC_UPDATE_HZ period later.
+index_foc_control_apply:
+		lds	temp1, index_q_command
+		tst	temp1
+		breq	index_foc_control_stop
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_PWM_RUNNING
+		rjmp	index_foc_control_start
+		ret
+index_foc_control_stop:
+		rcall	index_six_step_update
+		ret
+index_foc_control_start:
 		rcall	index_foc_vector_step
+		rcall	index_six_step_update
+		sts	index_foc_divider, ZH
+		sts	index_foc_due, ZH
 		ret
 
 	; Error-diffuse the sine-weighted following-vector dwell at the 1 kHz SVM

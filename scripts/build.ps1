@@ -1,4 +1,5 @@
-# Build the KA nFET firmware on Windows. Requires AVRA in PATH or the fallback below.
+# Build the KA nFET firmware on Windows. This mirrors the KA-only Makefile
+# without requiring make.exe on a stock Windows development machine.
 
 $ErrorActionPreference = 'Stop'
 $repoDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
