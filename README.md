@@ -20,16 +20,18 @@ For installation, normal operation, and fault-code checks, see
 |---|---|
 | MCU | ATmega8A at 16 MHz |
 | Normal drive | SimonK sensorless six-step commutation |
-| Command | RC PWM on PD2/INT0; legacy SimonK I2C is retained |
+| Command | RC PWM on PD2/INT0 only; no I2C throttle/control interface |
 | Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
 | Position/encoder update | 4.096 ms / 244.14 Hz |
 | Index drive | Voltage-mode sensored FOC; 1 kHz two-vector SVM, 20 kHz homing PDM |
 | Persistent data | Mechanical home and electrical calibration in EEPROM |
 | Firmware image | `ka_nfet.hex` |
 
-The AS5600 is used only while the motor is stopped. SimonK is otherwise
-unchanged except for hooks that capture home, arm indexing after a run, and
-service calibration or positioning at zero throttle.
+The AS5600 is used only while the motor is stopped. TWI is reserved exclusively
+for AS5600 master transactions; this target does not compile the legacy SimonK
+I2C-slave throttle or BLConfig command mode. SimonK is otherwise unchanged
+except for hooks that capture home, arm indexing after a run, and service
+calibration or positioning at zero throttle.
 
 ## Runtime sequence
 

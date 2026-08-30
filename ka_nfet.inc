@@ -10,7 +10,7 @@
 
 .equ	F_CPU		= 16000000
 .equ	USE_INT0	= 1	; PWM command input on PD2 / INT0
-.equ	USE_I2C		= 0	; Legacy SimonK slave support; indexing reuses TWI as AS5600 master while stopped
+.equ	USE_I2C		= 0	; Must remain 0: no I2C throttle/control; TWI is reserved for AS5600 master reads
 .equ	USE_UART	= 0	; Present in known-good firmware; PD0/RX and PD1/TX are not externally used
 .equ	USE_ICP		= 0
 

@@ -249,6 +249,12 @@
 .equ	MAX_POWER	= (POWER_RANGE-1)
 
 .if INDEX_ENABLE
+	; The legacy USE_I2C path makes this ESC an I2C slave for throttle and
+	; BLConfig commands. Indexing uses the same peripheral as an AS5600 master,
+	; so these two roles are deliberately mutually exclusive for this target.
+.if USE_I2C
+.error "INDEX_ENABLE requires USE_I2C = 0; TWI is reserved for the AS5600 encoder"
+.endif
 ; Index-mode implementation constants. The board file deliberately exposes
 ; only enable/commissioning, controller, and electrical safety settings.
 .equ	INDEX_CONTROL_PERIOD_US = 4096
