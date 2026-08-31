@@ -9,7 +9,7 @@ The ESC runs the motor normally while throttle is applied. After the motor has
 run and throttle returns to zero, it waits about three seconds for the rotor to
 coast. It then moves the rotor slowly to the stored home position.
 
-The homing target moves at about 15 rotor RPM. Homing stops when the rotor is at
+The homing target moves at about 60 rotor RPM. Homing stops when the rotor is at
 home and nearly stationary. A homing attempt is cancelled immediately by a new
 nonzero throttle command and is aborted if it takes longer than eight seconds.
 
