@@ -271,7 +271,7 @@ Current configured values are:
 |---|---:|---|
 | `INDEX_P_GAIN` | 12 | P = 0.75 |
 | `INDEX_I_GAIN` | 2 | I = 0.125 |
-| `INDEX_D_GAIN` | 32 | D = 0.5 per measured encoder count/update |
+| `INDEX_D_GAIN` | 32 | D = 2.0 per measured encoder count/update |
 | `INDEX_I_MAX` | 16384 | Symmetric integral-accumulator clamp |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
 | `INDEX_HOME_SLEW_RPM` | 60 | Mechanical target slew rate |
@@ -367,10 +367,8 @@ One-click wrappers remain the practical entry point on Windows and macOS:
 ./build.sh
 ```
 
-The following may be outdated:
-
-The current normal build uses 6456 application bytes and 110 bytes of SRAM,
-leaving 712 bytes before the boot section at word address `0x0E00`.
+The current build uses 6498 application bytes and 118 bytes of SRAM, leaving
+670 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

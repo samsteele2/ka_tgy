@@ -618,6 +618,8 @@ blc_templimit:	.byte	1	; BLConfig temperature limit
 blc_currscale:	.byte	1	; BLConfig current scaling
 blc_bitconfig:	.byte	1	; BLConfig bitconfig (1 == MOTOR_REVERSE)
 blc_checksum:	.byte	1	; BLConfig checksum (0xaa + above bytes)
+.else
+eeprom_blc_reserved: .byte 8	; Preserve index-field offsets from USE_I2C firmware
 .endif
 .if INDEX_ENABLE
 index_home_l:	.byte	1	; Calibrated AS5600 mechanical home, low byte
@@ -695,6 +697,8 @@ eeprom_defaults_w:
 	.db 255, 255		; PwmScaling, CurrentLimit
 	.db 127, 0		; TempLimit, CurrentScaling
 	.db 0, byte1(0xaa + BL_REVISION + 144 + 255 + 255 + 127 + 0 + 0)	; BitConfig, crc (0xaa + sum of above bytes)
+.else
+	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff	; Reserved legacy BLConfig slot
 .endif
 .if INDEX_ENABLE
 	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
