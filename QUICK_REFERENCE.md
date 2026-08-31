@@ -85,6 +85,8 @@ cancels that operation and returns control to normal motor operation.
   longer while the rotor settles.
 - After calibration, the rotor proceeds directly into the normal slow homing
   movement.
+- An invalid electrical CRC automatically starts this calibration. The stored
+  mechanical home is not part of that CRC and remains the homing target.
 - Do not restrain, push, or reposition the rotor during calibration.
 
 ## Low-beep fault codes

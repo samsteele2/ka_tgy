@@ -63,15 +63,22 @@ is recalibrated on the next eligible stop.
 
 The EEPROM record contains:
 
-- mechanical home and its validity marker;
+- mechanical home and its independent validity marker;
 - encoder direction and the configured pole-pair count;
 - electrical-angle offset;
 - fixed homing low-side pulse width;
-- a legacy nonzero density field retained for EEPROM layout compatibility; and
-- electrical record marker `0x60`, written last as the commit.
+- CRC-16/CCITT over only the electrical fields; and
+- electrical record marker `0x61`, written last as the commit.
 
-The legacy density field is not measured and is not used by the position
-controller.
+The home angle is deliberately excluded from the electrical CRC. A CRC mismatch
+or structurally invalid electrical field forces a new electrical calibration,
+but the stored home remains the best available docking target and is used by the
+homing movement after calibration. Electrical-record failure therefore cannot
+turn into a missing-home decision.
+
+The index build uses the fresh EEPROM schema signature `0x4B32` (`K2`). It does
+not migrate or interpret records made by older firmware. Installing this schema
+requires throttle/home calibration once before normal indexing.
 
 `INDEX_POLE_PAIRS` is compiled from `ka_nfet.inc` and copied into the committed
 electrical record. On boot, a different stored value invalidates that record and
@@ -159,6 +166,9 @@ inside the 4.096 ms position-control interval while retaining low output noise.
 Disabling the watchdog also keeps sensor behavior consistent after the rotor has
 been stationary for a long time. The analog-output selection is left at its
 default full-range mode but is irrelevant because this firmware uses I2C only.
+The bytes are written in AS5600 register order (`CONF_H` at `0x07`, then
+`CONF_L` at `0x08`) and read back before any bridge drive is allowed. A mismatch
+uses the normal two-low-beep sensor-fault path with the bridge off.
 
 ## Index power stage
 
@@ -367,8 +377,8 @@ One-click wrappers remain the practical entry point on Windows and macOS:
 ./build.sh
 ```
 
-The current build uses 6498 application bytes and 118 bytes of SRAM, leaving
-670 bytes before the boot section at word address `0x0E00`.
+The current build uses 6688 application bytes and 111 bytes of SRAM, leaving
+480 bytes before the boot section at word address `0x0E00`.
 
 The USBasp flash scripts program `ka_nfet.hex`, low fuse `0x3F`, and high
 fuse `0xCA`, then verify them. They do not rebuild:

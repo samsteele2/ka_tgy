@@ -314,17 +314,17 @@
 
 .equ	INDEX_AS5600_ADDR_W = 0x6c
 .equ	INDEX_AS5600_ADDR_R = 0x6d
-.equ	INDEX_AS5600_CONF_REG = 0x07
+.equ	INDEX_AS5600_CONF_H_REG = 0x07
 .equ	INDEX_AS5600_STATUS_REG = 0x0b
 .equ	INDEX_AS5600_RAW_ANGLE_REG = 0x0c
-.equ	INDEX_AS5600_CONF_L = 0x00	; Normal power, no output hysteresis
 .equ	INDEX_AS5600_CONF_H = 0x01	; 8x slow filter, fast filter/watchdog disabled
+.equ	INDEX_AS5600_CONF_L = 0x00	; Normal power, no output hysteresis
 .equ	INDEX_AS5600_STATUS_MD = 5	; A magnet is detected
 .equ	INDEX_AS5600_STATUS_MH = 3	; Magnet field strength too high
 .equ	INDEX_AS5600_STATUS_ML = 4	; Magnet field strength too low
 .equ	INDEX_TWBR = (F_CPU / 400000 - 16) / 2
 .equ	INDEX_HOME_MARKER = 0xa5
-.equ	INDEX_ELECTRICAL_MARKER = 0x60	; Aggregate sweep / averaged-offset record
+.equ	INDEX_ELECTRICAL_MARKER = 0x61	; CRC-protected aggregate sweep record
 
 ; Calibration emits 77 pulses per 256 20 kHz frames. This is approximately 20%
 ; stronger than the former 64/256 setting while retaining the same 8 us pulse
@@ -421,7 +421,11 @@
 .equ	T1CLK		= (1<<CS10)+(USE_ICP<<ICES1)+(USE_ICP<<ICNC1)	; clk/1 == 16MHz
 .equ	T2CLK		= (1<<CS20)	; clk/1 == 16MHz
 
-.equ	EEPROM_SIGN	= 31337		; Random 16-bit value
+.if INDEX_ENABLE
+.equ	EEPROM_SIGN	= 0x4b32		; "K2": clean checksum-protected index EEPROM schema
+.else
+.equ	EEPROM_SIGN	= 31337		; Original SimonK schema for non-index targets
+.endif
 .equ	EEPROM_OFFSET	= 0x80		; Offset into 512-byte space (why not)
 
 ; Conditional code inclusion
@@ -618,20 +622,19 @@ blc_templimit:	.byte	1	; BLConfig temperature limit
 blc_currscale:	.byte	1	; BLConfig current scaling
 blc_bitconfig:	.byte	1	; BLConfig bitconfig (1 == MOTOR_REVERSE)
 blc_checksum:	.byte	1	; BLConfig checksum (0xaa + above bytes)
-.else
-eeprom_blc_reserved: .byte 8	; Preserve index-field offsets from USE_I2C firmware
 .endif
 .if INDEX_ENABLE
 index_home_l:	.byte	1	; Calibrated AS5600 mechanical home, low byte
 index_home_h:	.byte	1	; Calibrated AS5600 mechanical home, high byte (0..15)
-index_home_valid: .byte 1	; INDEX_HOME_MARKER when home was successfully captured
+index_home_valid: .byte 1	; Independent marker; home is intentionally not checksummed
 index_electrical_offset_l: .byte 1 ; Automatically calibrated electrical offset
 index_electrical_offset_h: .byte 1
 index_stored_pole_pairs: .byte 1 ; Configured pole-pair count committed with alignment
 index_encoder_reverse: .byte 1	; 0: counts follow field sweep, 1: counts are reversed
 index_pwm_duty_l: .byte 1	; Fixed Timer2 pulse width used by homing density control
 index_pwm_duty_h: .byte 1
-index_breakaway_density: .byte 1 ; Legacy nonzero field retained in EEPROM layout
+index_electrical_checksum_l: .byte 1 ; CRC-16/CCITT over electrical payload only
+index_electrical_checksum_h: .byte 1
 index_electrical_valid: .byte 1	; Written last as the calibration commit marker
 .endif
 eeprom_end:	.byte	1
@@ -697,11 +700,9 @@ eeprom_defaults_w:
 	.db 255, 255		; PwmScaling, CurrentLimit
 	.db 127, 0		; TempLimit, CurrentScaling
 	.db 0, byte1(0xaa + BL_REVISION + 144 + 255 + 255 + 127 + 0 + 0)	; BitConfig, crc (0xaa + sum of above bytes)
-.else
-	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff	; Reserved legacy BLConfig slot
 .endif
 .if INDEX_ENABLE
-	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+	.db 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 .endif
 
 ;-- Instruction extension macros -----------------------------------------
@@ -3557,8 +3558,38 @@ index_home_invalid:
 		sec
 		ret
 
-	; Carry clear means that the measured direction/electrical offset and the
-	; configured pole-pair count form a complete committed EEPROM record.
+	; Calculate CRC-16/CCITT (polynomial 0x1021, initial value 0xffff) over only
+	; the electrical payload. Mechanical home is deliberately outside this range:
+	; a damaged electrical record must trigger alignment and then use the stored
+	; home as the best available docking target.
+index_electrical_checksum_compute:
+		ldi2	YL, YH, index_electrical_offset_l
+		ldi	temp1, 0xff		; CRC low
+		ldi	temp2, 0xff		; CRC high
+index_electrical_checksum_byte:
+		ld	temp3, Y+
+		eor	temp2, temp3		; XOR input byte into the CRC high byte
+		ldi	temp4, 8
+index_electrical_checksum_bit:
+		lsl	temp1
+		rol	temp2
+		brcc	index_electrical_checksum_no_poly
+		ldi	XL, low(0x1021)
+		eor	temp1, XL
+		ldi	XL, high(0x1021)
+		eor	temp2, XL
+index_electrical_checksum_no_poly:
+		dec	temp4
+		brne	index_electrical_checksum_bit
+		cpi	YL, low(index_electrical_checksum_l)
+		ldi	temp3, high(index_electrical_checksum_l)
+		cpc	YH, temp3
+		brne	index_electrical_checksum_byte
+		ret
+
+	; Carry clear means that the measured direction/electrical offset, configured
+	; pole-pair count, pulse width, CRC, and commit marker form one valid record.
+	; Any failure forces electrical calibration without modifying or rejecting home.
 index_electrical_is_valid:
 		lds	temp1, index_electrical_valid
 		cpi	temp1, INDEX_ELECTRICAL_MARKER
@@ -3582,9 +3613,13 @@ index_electrical_is_valid:
 		ldi	temp3, high(INDEX_HOME_DUTY_MAX + 1)
 		cpc	temp2, temp3
 		brcc	index_electrical_invalid
-		lds	temp1, index_breakaway_density
-		tst	temp1
-		breq	index_electrical_invalid
+		rcall	index_electrical_checksum_compute
+		lds	temp3, index_electrical_checksum_l
+		cp	temp1, temp3
+		brne	index_electrical_invalid
+		lds	temp3, index_electrical_checksum_h
+		cp	temp2, temp3
+		brne	index_electrical_invalid
 		clc
 		ret
 index_electrical_invalid:
@@ -4446,7 +4481,6 @@ index_calibration_start:
 		ldi	temp1, INDEX_CAL_PULSE_DENSITY
 		sts	index_pwm_density, temp1
 		sts	index_pwm_accumulator, ZH
-		sts	index_breakaway_density, temp1	; Legacy EEPROM field; PI does not use it
 		ldi2	temp1, temp2, INDEX_HOME_DUTY_MIN
 		sts	index_pwm_duty_l, temp1
 		sts	index_pwm_duty_h, temp2
@@ -4914,6 +4948,9 @@ index_calibration_offset_store:
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)
 		sts	index_state, temp1
+		rcall	index_electrical_checksum_compute
+		sts	index_electrical_checksum_l, temp1
+		sts	index_electrical_checksum_h, temp2
 		ldi	temp1, INDEX_ELECTRICAL_MARKER
 		sts	index_electrical_valid, temp1
 		rcall	eeprom_write_block
@@ -5009,16 +5046,7 @@ index_as5600_configure:
 		cpi	temp1, 0x18
 		brne	index_as5600_config_error
 
-		outi	TWDR, INDEX_AS5600_CONF_REG, temp1
-		ldi	temp1, (1<<TWINT)|(1<<TWEN)
-		rcall	index_twi_wait
-		brcs	index_as5600_config_error
-		in	temp1, TWSR
-		andi	temp1, 0xf8
-		cpi	temp1, 0x28
-		brne	index_as5600_config_error
-
-		outi	TWDR, INDEX_AS5600_CONF_L, temp1
+		outi	TWDR, INDEX_AS5600_CONF_H_REG, temp1
 		ldi	temp1, (1<<TWINT)|(1<<TWEN)
 		rcall	index_twi_wait
 		brcs	index_as5600_config_error
@@ -5028,6 +5056,15 @@ index_as5600_configure:
 		brne	index_as5600_config_error
 
 		outi	TWDR, INDEX_AS5600_CONF_H, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_config_error
+
+		outi	TWDR, INDEX_AS5600_CONF_L, temp1
 		ldi	temp1, (1<<TWINT)|(1<<TWEN)
 		rcall	index_twi_wait
 		brcs	index_as5600_config_error
@@ -5047,10 +5084,81 @@ index_as5600_configure_stop_wait:
 		brne	index_as5600_configure_stop_wait
 		rjmp	index_as5600_error
 index_as5600_configure_done:
-		clc
-		ret
+		rjmp	index_as5600_configure_verify
 index_as5600_config_error:
 		rjmp	index_as5600_error
+
+	; Read back both CONF bytes. ACKs alone prove only that the device accepted the
+	; transaction; homing must not begin unless the requested normal-power 8x-filter
+	; profile is actually active.
+index_as5600_configure_verify:
+		out	TWCR, ZH
+		out	TWSR, ZH
+		outi	TWBR, INDEX_TWBR, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x08
+		brne	index_as5600_config_error
+		outi	TWDR, INDEX_AS5600_ADDR_W, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x18
+		brne	index_as5600_config_error
+		outi	TWDR, INDEX_AS5600_CONF_H_REG, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x28
+		brne	index_as5600_config_error
+		ldi	temp1, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x10
+		brne	index_as5600_config_error
+		outi	TWDR, INDEX_AS5600_ADDR_R, temp1
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x40
+		brne	index_as5600_config_error
+		ldi	temp1, (1<<TWINT)|(1<<TWEA)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x50
+		brne	index_as5600_config_error
+		in	temp1, TWDR
+		cpi	temp1, INDEX_AS5600_CONF_H
+		brne	index_as5600_config_error
+		ldi	temp1, (1<<TWINT)|(1<<TWEN)
+		rcall	index_twi_wait
+		brcs	index_as5600_config_error
+		in	temp1, TWSR
+		andi	temp1, 0xf8
+		cpi	temp1, 0x58
+		brne	index_as5600_config_error
+		in	temp1, TWDR
+		cpi	temp1, INDEX_AS5600_CONF_L
+		breq	index_as5600_configure_verify_done
+		rjmp	index_as5600_config_error
+index_as5600_configure_verify_done:
+		ldi	temp1, (1<<TWINT)|(1<<TWSTO)|(1<<TWEN)
+		out	TWCR, temp1
+		clc
+		ret
 
 	; Read STATUS (0x0b) and RAW ANGLE (0x0c/0x0d) in one burst. RAW ANGLE is
 	; the unscaled/unmodified 12-bit position; ANGLE's scaling and 10-LSB
@@ -5192,8 +5300,7 @@ index_as5600_warning_done:
 		ret
 
 	; Homing uses its fixed safe pulse width. The continuous PI result directly
-	; sets pulse density; the legacy EEPROM breakaway field is not used. Zero
-	; command coasts with no braking interval.
+	; sets pulse density, and zero command coasts with no braking interval.
 index_six_step_update:
 		lds	temp1, index_q_command
 		tst	temp1
