@@ -18,23 +18,29 @@
 .equ	DEAD_HIGH_NS	= 300
 .equ	COMP_PWM		= 1
 
-; Post-flight blade indexing. These are the settings intended to be changed
-; for this board. Controller gains, state values, protocol constants, and
-; derived timing live beside the implementation in tgy.asm.
+; Blade indexing and persistent home behavior. These are the settings intended
+; to be changed for this board. Controller gains, state values, protocol
+; constants, and derived timing live beside the implementation in tgy.asm.
 .equ	INDEX_ENABLE			= 1	; Compile the AS5600 home-index feature
 .equ	INDEX_DRIVE_ENABLE		= 1	; Set to 0 for sensor-only commissioning
+.equ	INDEX_PERSISTENT_HOMING	= 1	; Home after startup and monitor/re-hold home while throttle is zero
+; The following three settings have no effect when INDEX_PERSISTENT_HOMING = 0.
+.equ	INDEX_RESTART_HOMING_BEYOND_DEGREES = 15 ; Re-home outside +/- this mechanical angle; 0 continuously holds
+.equ	INDEX_HOMING_RETRY_ENABLE = 1	; Retry a failed persistent-home attempt after the cooldown
+.equ	INDEX_HOMING_RETRY_COOLDOWN_SECONDS = 15 ; Bridge-off delay after an index error before retry
 .equ	INDEX_HOME_DELAY_MS		= 3000	; Coast time before normal homing
 .equ	INDEX_CALIBRATION_DELAY_MS = 3000	; Coast time before electrical calibration
 .equ	INDEX_POLE_PAIRS		= 7	; 12N14P motor: 14 rotor poles / 2
-.equ	INDEX_FOC_UPDATE_HZ		= 1000	; Timer2-scheduled sine-weighted SVM vector-selection rate
+.equ	INDEX_FOC_UPDATE_DIVIDER	= 46	; 20 kHz / 46 = 434.78 Hz SVM vector-selection rate
 
 ; Slewed-target position controller. P, I, and D are in sixteenths: 4 means 0.25.
 ; I accumulates on every update, resets when position error crosses zero, and is
 ; divided by 32 before I gain is applied. Deadzone is a +/- angular tolerance.
 .equ	INDEX_P_GAIN			= 12
-.equ	INDEX_I_GAIN			= 2
+.equ	INDEX_I_GAIN			= 3
 .equ	INDEX_D_GAIN			= 32
-.equ	INDEX_I_MAX				= 16384
+.equ	INDEX_I_MAX				= 20435
+.equ	INDEX_HOME_OUTPUT_MAX	= 196	; Final homing-voltage ceiling, 1..255
 .equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 180 = 3 degrees from home
 .equ	INDEX_HOME_SLEW_RPM		= 60	; Mechanical target speed toward home
 .equ	INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES = 360 ; Target-to-rotor safety bound

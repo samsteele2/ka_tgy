@@ -1,8 +1,9 @@
 # KA nFET ESC firmware
 
 Experimental ATmega8A firmware for PCB-783B1-02. Normal operation uses the
-existing SimonK sensorless ESC code. This fork adds AS5600 electrical alignment
-and post-run positioning to a stored mechanical home.
+existing SimonK sensorless ESC code. This fork adds AS5600 electrical alignment,
+startup/post-run positioning, and optional persistent holding of a stored
+mechanical home.
 
 For installation, normal operation, and fault-code checks, see
 [QUICK_REFERENCE.md](QUICK_REFERENCE.md).
@@ -12,7 +13,8 @@ For installation, normal operation, and fault-code checks, see
 > waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
 > limits each calibration pulse to 8.0 us. Calibration emits at most one pulse
 > at 77/255 density (approximately 6.0 kHz effective, 4.8% average duty); this is not a
-> phase-current limit.
+> phase-current limit. `INDEX_HOME_OUTPUT_MAX` independently limits the homing
+> voltage command, but it is also not a phase-current limit.
 
 ## System overview
 
@@ -23,22 +25,29 @@ For installation, normal operation, and fault-code checks, see
 | Command | RC PWM on PD2/INT0 only; no I2C throttle/control interface |
 | Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
 | Position/encoder update | 4.096 ms / 244.14 Hz |
-| Index drive | Voltage-mode sensored FOC; 1 kHz two-vector SVM, 20 kHz homing PDM |
+| Index drive | Voltage-mode sensored FOC; 434.8 Hz two-vector SVM, 20 kHz homing PDM |
+| Persistent behavior | Startup and post-run homing; bridge-off monitoring or continuous hold |
 | Persistent data | Mechanical home and electrical calibration in EEPROM |
 | Firmware image | `ka_nfet.hex` |
 
 The AS5600 is used only while the motor is stopped. TWI is reserved exclusively
 for AS5600 master transactions; this target does not compile the legacy SimonK
 I2C-slave throttle or BLConfig command mode. SimonK is otherwise unchanged
-except for hooks that capture home, arm indexing after a run, and service
-calibration or positioning at zero throttle.
+except for hooks that capture home and service calibration, positioning, or
+bridge-off home monitoring at zero throttle.
 
 ## Runtime sequence
 
-1. Boot with all MOSFETs off and load EEPROM.
-2. Arm and run as a conventional SimonK ESC.
-3. A nonzero command arms one future index cycle. Power-up at zero throttle
-   cannot start indexing.
+1. Boot with all MOSFETs off, load EEPROM, accept a stable zero-throttle input,
+   and finish the normal startup/RC-ready tones.
+2. With `INDEX_PERSISTENT_HOMING = 1`, schedule homing after startup even if the
+   motor has not run. The bridge stays off for the applicable normal homing or
+   calibration delay. A home captured during this startup bypasses that delay
+   and proceeds directly to fresh electrical calibration and homing after the
+   acknowledgment and RC-ready tones.
+3. Arm and run as a conventional SimonK ESC. Any accepted nonzero command
+   immediately cancels monitoring, retry, calibration, or homing and gives the
+   bridge back to normal SimonK sensorless control.
 4. On return to zero throttle, turn the bridge off. Coast for
    `INDEX_HOME_DELAY_MS` when the stored electrical record is valid, or
    `INDEX_CALIBRATION_DELAY_MS` when a new electrical calibration is required.
@@ -49,17 +58,28 @@ calibration or positioning at zero throttle.
    zero using the configured motor pole count, then commit the result.
 7. Initialize the position target at the measured rotor angle, slew it toward
    mechanical home, and run the PID controller against that moving target.
-8. After the target reaches home, turn the complete bridge off when position
-   and motion are within tolerance. Abort after eight seconds if it cannot settle.
+8. After the target reaches home and satisfies the terminal position/motion
+   tests, apply the configured persistent behavior:
 
-A new nonzero throttle command always cancels calibration or positioning and
-returns control to SimonK.
+   - with a nonzero `INDEX_RESTART_HOMING_BEYOND_DEGREES`, turn the complete
+     bridge off, continue reading the encoder every 4.096 ms, and start a new
+     homing trajectory only if the shortest wrapped error leaves the symmetric
+     tolerance;
+   - with `INDEX_RESTART_HOMING_BEYOND_DEGREES = 0`, keep the home-position PID
+     active continuously while throttle remains zero.
+
+9. A hard sensor, calibration, or homing error always turns the bridge off before
+   its low-beep code. If persistent retry is enabled, wait
+   `INDEX_HOMING_RETRY_COOLDOWN_SECONDS`, then perform the complete preflight and
+   try again. Abort the current trajectory after eight seconds if it cannot settle.
 
 ## Home and EEPROM data
 
 Throttle calibration captures the AS5600 angle at the learned low-throttle
-endpoint as mechanical home. A new home invalidates the electrical record so it
-is recalibrated on the next eligible stop.
+endpoint as mechanical home. A new home invalidates the electrical record. With
+persistent homing enabled, electrical calibration and homing begin directly after
+the remaining acknowledgment/RC-ready tones; otherwise recalibration occurs on
+the next eligible run-to-zero event.
 
 The EEPROM record contains:
 
@@ -187,38 +207,47 @@ T2 = magnitude * sin(alpha)
 T0 = 1 - T1 - T2
 ```
 
-Here, `alpha` is the requested angle inside its 60-degree sector. At
-`INDEX_FOC_UPDATE_HZ`, a first-order dwell accumulator selects between the two
-active vectors in the ratio `T2/(T1+T2)`. The 20 kHz pulse density is multiplied
-by `T1+T2`; unpowered carrier frames supply `T0`. Unlike linear interpolation,
-this traces the largest constant-radius circle inside the inverter voltage
-hexagon. Maximum circular magnitude is therefore 86.6% of a single active-vector
-magnitude. The table is sampled every eight encoder counts (about 0.7 electrical
-degrees), limiting calculated radius error to less than 0.25%.
+Here, `alpha` is the requested angle inside its 60-degree sector. Every
+`INDEX_FOC_UPDATE_DIVIDER` carrier frames, a first-order dwell accumulator
+selects between the two active vectors in the ratio `T2/(T1+T2)`. The checked-in
+divider of 46 gives a fixed 434.78 Hz selection rate from the 20 kHz carrier. The
+20 kHz pulse density is multiplied by `T1+T2`; unpowered carrier frames supply
+`T0`. Unlike linear interpolation, this traces the largest constant-radius circle
+inside the inverter voltage hexagon. Maximum circular magnitude is therefore
+86.6% of a single active-vector magnitude. The table is sampled every eight
+encoder counts (about 0.7 electrical degrees), limiting calculated radius error
+to less than 0.25%.
 
 This space-vector interpolation removes the former 60-electrical-degree angle
 steps and 15.5% hexagonal magnitude envelope. Position control publishes updated
 SVM parameters every 4.096 ms, but only the Timer2-derived scheduler selects an
-active vector. Therefore `INDEX_FOC_UPDATE_HZ` is the real recurring vector and
-high-side commutation bound. A zero command turns the bridge off immediately;
+active vector. Therefore `20000 / INDEX_FOC_UPDATE_DIVIDER` is the recurring
+vector-selection rate and an upper bound on high-side commutation. A zero command
+turns the bridge off immediately;
 the first nonzero command from a stopped bridge performs one initial selection,
 then begins a full scheduled interval.
 
 Each vector energizes one high-side source and a different phase low-side sink.
-Only the sink is pulsed. A vector transition performs:
+Only the sink is pulsed. Adjacent pairs 1/2, 3/4, and 5/0 share C+, B+, and A+
+respectively. For those transitions, firmware stops Timer2 and turns every low
+side off, preserves the already-enhanced shared source, observes break-before-
+make delay, changes the sink selection, and resumes PDM. It does not unnecessarily
+discharge and recharge the shared high-side gate.
 
-1. all six MOSFETs off;
-2. `INDEX_DEADTIME_US` all-off delay;
-3. select one high-side source;
-4. another `INDEX_DEADTIME_US` delay; and
-5. start low-side pulses on the sink phase.
+The other adjacent pairs share a sink and require the high-side source to change.
+Those transitions retain the conservative all-six-off sequence, one
+`INDEX_DEADTIME_US` break delay, high-side selection, a second
+`INDEX_DEADTIME_US` rise delay, and then low-side pulses. If the discrete vector
+selection does not change, neither side is commutated.
 
 With the current configuration, calibration uses fixed 8.0 us low-side pulses
 at approximately 6.0 kHz effective, for 4.8% average applied duty. Homing uses a
 separate fixed 3.5 us pulse, and an 8-bit modulo-255 accumulator varies its
-density from 0 to 255 frames at a 20 kHz carrier. Its accumulator is preserved
-across adjacent-vector commutation so torque magnitude does not restart at every
-SVM update. Zero controller output coasts; indexing never applies dynamic braking.
+density from 0 through `INDEX_HOME_OUTPUT_MAX` frames at a 20 kHz carrier. The
+checked-in limit of 128 is approximately half of the previously available
+maximum pulse density. Its accumulator is preserved across adjacent-vector
+commutation so torque magnitude does not restart at every SVM update. Zero
+controller output coasts; indexing never applies dynamic braking.
 
 ## Position-control specification
 
@@ -254,26 +283,31 @@ if error[k] crossed zero:
     integral[k-1] = 0
 integral[k] = clamp(integral[k-1] + error[k], -I_MAX, I_MAX)
 
-u = trunc(P * error[k])
-  + trunc(I * trunc(integral[k] / 32))
-  - trunc(D * velocity[k])
+u_raw = trunc(P * error[k])
+      + trunc(I * trunc(integral[k] / 32))
+      - trunc(D * velocity[k])
+if abs(u_raw) >= HOME_OUTPUT_MAX and sign(error[k]) == sign(u_raw):
+    integral[k] = integral[k-1]
+u = clamp(u_raw, -HOME_OUTPUT_MAX, HOME_OUTPUT_MAX)
 ```
 
 P, I, and D are configured in sixteenths. D acts on measured rotor movement
 rather than the change in moving-target error, preventing target-slew derivative
-kick. Integral action runs on every control
-update, including while output is saturated and while the rotor is moving. The
-accumulator is cleared when the signed position error changes sign or is exactly
-zero, preventing stored torque from continuing in the old direction after the
-rotor crosses the moving target. Between crossings, `INDEX_I_MAX` bounds its
-magnitude.
+kick. Integral action runs on every control update while the rotor is moving.
+When the voltage command reaches its final limit, an integral update that would
+push it farther into saturation is rolled back; opposite-signed error remains
+free to unwind the integrator. The accumulator is cleared when the signed
+position error changes sign or is exactly zero, preventing stored torque from
+continuing in the old direction after the rotor crosses the moving target.
+Between crossings, `INDEX_I_MAX` bounds its magnitude.
 
 Once the target reaches home, the same law naturally becomes home-position PID
-control. The signed command is saturated to -255 through 255. Its magnitude sets
-the circular q-axis voltage request, and sine-weighted SVM converts that request
-to angle-dependent pulse density. Its sign selects torque direction. There is no
-stall counter, dead-zone inversion, learned minimum output, or homing breakaway
-pulse.
+control. The signed command is saturated symmetrically at
+`INDEX_HOME_OUTPUT_MAX`; the checked-in value is -128 through 128. Its magnitude
+sets the circular q-axis voltage request, and sine-weighted SVM converts that
+request to angle-dependent pulse density. Its sign selects torque direction.
+There is no stall counter, dead-zone inversion, learned minimum output, or
+homing breakaway pulse.
 
 Current configured values are:
 
@@ -283,6 +317,7 @@ Current configured values are:
 | `INDEX_I_GAIN` | 2 | I = 0.125 |
 | `INDEX_D_GAIN` | 32 | D = 2.0 per measured encoder count/update |
 | `INDEX_I_MAX` | 16384 | Symmetric integral-accumulator clamp |
+| `INDEX_HOME_OUTPUT_MAX` | 128 | Symmetric final voltage-command ceiling; approximately 50% maximum pulse density |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
 | `INDEX_HOME_SLEW_RPM` | 60 | Mechanical target slew rate |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | 360 | Maximum target-to-rotor separation |
@@ -301,10 +336,26 @@ one degree. Firmware converts it to the nearest AS5600 count at assembly time;
 180 minutes becomes 34 counts, or approximately 2.99 degrees on either side of
 home.
 
-Completion immediately turns the bridge off and is terminal for that stopped
-cycle. If these conditions have not been met after
+With persistent homing disabled, completion immediately turns the bridge off and
+is terminal for that stopped cycle. With persistent homing enabled and a nonzero
+restart tolerance, completion also turns the bridge off, but RAW_ANGLE continues
+to be polled at 244.14 Hz. A new trajectory starts when the shortest wrapped
+mechanical error is strictly greater than
+`INDEX_RESTART_HOMING_BEYOND_DEGREES`; the checked-in 15-degree value therefore
+defines a 30-degree-wide release window centered on home.
+
+With `INDEX_RESTART_HOMING_BEYOND_DEGREES = 0`, satisfying the terminal tests
+marks the initial home attempt successful but does not turn off the bridge or
+position controller. The homing watchdog no longer applies after that first
+settle, and PID continues to oppose external motion for as long as valid zero
+throttle is present.
+
+If the initial trajectory has not met the terminal tests after
 `INDEX_HOME_TIMEOUT_SECONDS`, the firmware turns the bridge off and emits five
-low beeps.
+low beeps. Persistent retry, when enabled, waits the configured all-off cooldown
+before starting a new preflight/attempt. The same retry policy follows hard
+sensor and electrical-calibration faults. Advisory ML/MH tones do not count as a
+failed attempt.
 
 ## Remaining predictable edge cases
 
@@ -312,14 +363,14 @@ The controller is substantially simpler, but these behaviors are intentional:
 
 - With P = 0.75, target-tracking errors of approximately 340 counts or more
   saturate the proportional output.
-- The integral can still reach its clamp during a saturated approach, although
-  crossing the moving target clears it before accumulation begins in the
-  opposite direction.
-- D uses one raw wrapped AS5600 sample delta. Gain 8 suppresses a one-count
-  change through fixed-point truncation, but larger encoder noise appears in the
-  damping command.
+- Saturation-aware rollback prevents same-direction integral windup at the final
+  output ceiling. `INDEX_I_MAX` still limits the accumulator before output
+  saturation and while opposite-signed error is unwinding it.
+- D uses one raw wrapped AS5600 sample delta, so encoder noise can appear in the
+  damping command according to the configured gain.
 - Output magnitude remains quantized by 8-bit pulse density. Voltage angle is a
-  sine-weighted time average of adjacent active vectors at `INDEX_FOC_UPDATE_HZ`.
+  sine-weighted time average of adjacent active vectors at the configured
+  `20000 / INDEX_FOC_UPDATE_DIVIDER` rate.
 - The trajectory limits target separation, but there is no direct rotor-speed
   feedback or acceleration controller.
 - The exact 180-degree position error has two equivalent paths; signed wrapping
@@ -328,7 +379,8 @@ The controller is substantially simpler, but these behaviors are intentional:
 
 Tune P first, increase D to remove overshoot, then introduce I only as needed to
 overcome steady position error. Use `INDEX_I_MAX` to bound the maximum stored
-integral torque.
+integral torque and `INDEX_HOME_OUTPUT_MAX` to set the final homing-voltage
+ceiling without changing the individual gains.
 
 ## User configuration
 
@@ -338,12 +390,17 @@ User-facing settings are in `ka_nfet.inc`:
 |---|---|
 | `INDEX_ENABLE` | Compile AS5600 indexing. |
 | `INDEX_DRIVE_ENABLE` | Set to 0 for sensor-only commissioning. |
+| `INDEX_PERSISTENT_HOMING` | Set to 1 for startup homing plus persistent monitoring/holding at zero throttle. |
+| `INDEX_RESTART_HOMING_BEYOND_DEGREES` | Symmetric mechanical release tolerance in degrees (0..180). Default 15 means re-home outside +/-15 degrees; 0 keeps PID active continuously. |
+| `INDEX_HOMING_RETRY_ENABLE` | Set to 1 to retry hard homing/calibration/sensor failures while throttle remains zero. |
+| `INDEX_HOMING_RETRY_COOLDOWN_SECONDS` | All-off delay before a persistent retry, 1..60 seconds. |
 | `INDEX_HOME_DELAY_MS` | All-off coast time before normal homing, in milliseconds. |
 | `INDEX_CALIBRATION_DELAY_MS` | All-off coast time before electrical calibration, in milliseconds. |
 | `INDEX_POLE_PAIRS` | Rotor pole-pair count. Use 7 for a standard 12N14P motor. |
-| `INDEX_FOC_UPDATE_HZ` | Sine-weighted space-vector interpolation rate; must divide 20 kHz. |
+| `INDEX_FOC_UPDATE_DIVIDER` | 20 kHz carrier-frame divider for sine-weighted vector selection; 46 gives 434.78 Hz. Valid range is 10..200. |
 | `INDEX_P_GAIN`, `INDEX_I_GAIN`, `INDEX_D_GAIN` | Controller gains in sixteenths. D damps measured rotor motion. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
+| `INDEX_HOME_OUTPUT_MAX` | Final symmetric homing-voltage magnitude, 1..255. It does not change calibration strength or the P/I/D gains. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
 | `INDEX_HOME_SLEW_RPM` | Mechanical target slew rate toward home. |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | Maximum target lead over the measured rotor. |
@@ -354,6 +411,12 @@ User-facing settings are in `ka_nfet.inc`:
 
 Protocol constants, state values, validation tolerances, and fixed-point scales
 remain private to `tgy.asm`.
+
+The three subordinate persistent settings
+(`INDEX_RESTART_HOMING_BEYOND_DEGREES`, `INDEX_HOMING_RETRY_ENABLE`, and
+`INDEX_HOMING_RETRY_COOLDOWN_SECONDS`) have no effect when
+`INDEX_PERSISTENT_HOMING = 0`. They intentionally take effect when persistent
+homing is enabled.
 
 ## Build and flash
 

@@ -5,13 +5,24 @@ details and firmware settings, see [README.md](README.md).
 
 ## What the system does
 
-The ESC runs the motor normally while throttle is applied. After the motor has
-run and throttle returns to zero, it waits about three seconds for the rotor to
-coast. It then moves the rotor slowly to the stored home position.
+The ESC runs the motor normally while throttle is applied. The checked-in
+persistent-homing configuration also homes after a normal zero-throttle startup.
+After the motor has run and throttle returns to zero, it waits about three
+seconds for the rotor to coast, then moves the rotor slowly to the stored home
+position.
 
 The homing target moves at about 60 rotor RPM. Homing stops when the rotor is at
-home and nearly stationary. A homing attempt is cancelled immediately by a new
-nonzero throttle command and is aborted if it takes longer than eight seconds.
+home and nearly stationary. It then turns the bridge off but continues monitoring
+the AS5600. If the rotor moves beyond +/-15 degrees from home, it starts another
+homing movement. A homing attempt is cancelled immediately by a new nonzero
+throttle command and is aborted if it takes longer than eight seconds. A hard
+failure leaves the bridge off for five seconds and then retries while zero
+throttle remains commanded.
+
+The checked-in `INDEX_HOME_OUTPUT_MAX = 128` setting limits homing to
+approximately half of the modulation's available pulse density. This is a
+voltage-command ceiling, not measured phase-current protection. Electrical
+calibration uses its separate configured drive limit.
 
 The checked-in firmware is configured for a standard 12-slot, 14-pole motor
 (`INDEX_POLE_PAIRS = 7`). Electrical calibration aligns encoder direction and
@@ -29,11 +40,12 @@ expected. The motor must be allowed to rotate freely during this time.
 3. Program and verify `ka_nfet.hex`. The supplied flash scripts use USBasp and
    also program the board fuse values. They do not rebuild the firmware.
 4. Perform throttle and home calibration as described below.
-5. Start the motor briefly with a nonzero throttle command, then return to zero.
-6. Leave the rotor untouched. After the coast delay, allow electrical
-   calibration and the following homing movement to finish.
-7. If calibration succeeds, cycle power and repeat a brief run-to-zero test.
-8. Confirm that the rotor returns smoothly to home and that the ESC, motor, and
+5. Leave the rotor untouched. After the endpoint acknowledgments and RC-ready
+   tones, allow electrical calibration and the following homing movement to
+   finish; a brief motor run is not required first.
+6. If calibration succeeds, cycle power and verify startup homing, then repeat a
+   brief run-to-zero test.
+7. Confirm that the rotor returns smoothly to home and that the ESC, motor, and
    wiring remain at acceptable temperatures before fitting the propeller.
 
 ## Learning throttle range and home
@@ -52,9 +64,10 @@ home.
    until the measurement finishes.
 6. Wait for two high-pitched acknowledgment beeps. These confirm the low
    endpoint and home position.
-7. Disconnect power before removing any fixture.
-8. Return to normal zero-throttle operation. The next run-to-zero cycle will
-   perform a fresh electrical calibration.
+7. Keep clear after the remaining startup tones. The electrical record is now
+   invalidated intentionally, so electrical calibration begins immediately and
+   proceeds directly into homing.
+8. Disconnect power before removing any fixture.
 
 If the desired home changes, repeat this procedure. Never reach into the
 propeller or manually restrain a powered motor while the low endpoint is being
@@ -63,16 +76,28 @@ accepted.
 ## Normal operating procedure
 
 1. Begin with a valid zero-throttle command and power the ESC normally.
-2. Operate the motor as a conventional ESC.
-3. After the motor has run, return throttle to zero.
-4. Expect approximately three seconds of unpowered coasting.
-5. Keep clear while the rotor slews slowly to home. An approximately 1 kHz tone
+2. After the RC-ready tones, expect approximately three seconds with the bridge
+   off, followed by startup homing.
+3. Operate the motor as a conventional ESC.
+4. After the motor has run, return throttle to zero and expect approximately
+   three seconds of unpowered coasting.
+5. Keep clear while the rotor slews slowly to home. An approximately 435 Hz tone
    from the audible-rate sine-weighted voltage-vector interpolation is expected.
-6. The ESC turns off when the rotor reaches home and settles.
+6. The ESC turns the bridge off when the rotor reaches home and settles, but
+   continues monitoring position. Moving more than +/-15 degrees from home
+   starts another homing movement.
 
-Powering up at zero throttle does not initiate homing by itself. The motor must
-first receive a nonzero command. Applying throttle during calibration or homing
-cancels that operation and returns control to normal motor operation.
+Applying throttle during the startup delay, retry cooldown, calibration, homing,
+or bridge-off monitoring cancels that operation and returns control to normal
+motor operation.
+
+These statements describe the checked-in settings. If
+`INDEX_PERSISTENT_HOMING = 0`, startup homing, post-home monitoring, continuous
+hold, and automatic retry are disabled; the tolerance, retry-enable, and retry
+cooldown settings then have no effect. If
+`INDEX_RESTART_HOMING_BEYOND_DEGREES = 0`, the bridge does not release after
+settling: the PID controller remains active continuously at zero throttle and
+opposes external movement.
 
 ## Expected calibration behavior
 
@@ -91,8 +116,10 @@ cancels that operation and returns control to normal motor operation.
 
 ## Low-beep fault codes
 
-Count the repeated **low-pitched** beeps after an indexing failure. Power the
-system off before inspecting it.
+Count each group of **low-pitched** beeps after an indexing failure. With the
+checked-in retry setting, a hard fault is followed by five bridge-off seconds and
+then another attempt, so the same group may repeat. Power the system off before
+inspecting it.
 
 | Beeps | Meaning | First checks |
 |---:|---|---|
@@ -125,9 +152,10 @@ stopped calibration or homing sequence.
 Report the beep count, supply voltage, observed current, whether the propeller
 was installed, and what the rotor did immediately before the failure.
 
-After correcting the problem, retry by applying a nonzero throttle command and
-then returning to zero, or by cycling power and performing another run-to-zero
-cycle. Stop repeated attempts if temperatures continue to rise.
+After correcting the problem, persistent mode retries automatically after its
+cooldown while zero throttle remains valid. Applying nonzero throttle cancels a
+pending retry. With retry disabled, apply a nonzero command and return to zero,
+or cycle power. Stop repeated attempts if temperatures continue to rise.
 
 ## Flashing the supplied image
 

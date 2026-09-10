@@ -260,6 +260,7 @@
 .equ	INDEX_CONTROL_PERIOD_US = 4096
 .equ	INDEX_HOME_DELAY_TICKS = (INDEX_HOME_DELAY_MS * 1000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 .equ	INDEX_CALIBRATION_DELAY_TICKS = (INDEX_CALIBRATION_DELAY_MS * 1000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
+.equ	INDEX_HOMING_RETRY_COOLDOWN_TICKS = (INDEX_HOMING_RETRY_COOLDOWN_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 .equ	INDEX_HOME_TIMEOUT_TICKS = (INDEX_HOME_TIMEOUT_SECONDS * 1000000 + INDEX_CONTROL_PERIOD_US - 1) / INDEX_CONTROL_PERIOD_US
 ; Q8 mechanical counts/update. For the fixed 4096 us service period this is
 ; rpm * 4096 counts/rev * 4096 us/update * 256 / 60,000,000 us/min.
@@ -267,6 +268,19 @@
 .equ	INDEX_HOME_SLEW_STEP_COUNTS = INDEX_HOME_SLEW_STEP_Q8 / 256
 .equ	INDEX_HOME_SLEW_STEP_FRACTION = low(INDEX_HOME_SLEW_STEP_Q8)
 .equ	INDEX_HOME_MAX_LEAD_COUNTS = (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES * 4096 + 180) / 360
+.equ	INDEX_RESTART_HOMING_BEYOND_COUNTS = (INDEX_RESTART_HOMING_BEYOND_DEGREES * 4096 + 180) / 360
+.if (INDEX_PERSISTENT_HOMING < 0) || (INDEX_PERSISTENT_HOMING > 1)
+.error "INDEX_PERSISTENT_HOMING must be 0 or 1"
+.endif
+.if (INDEX_RESTART_HOMING_BEYOND_DEGREES < 0) || (INDEX_RESTART_HOMING_BEYOND_DEGREES > 180)
+.error "INDEX_RESTART_HOMING_BEYOND_DEGREES must be in the range 0..180"
+.endif
+.if (INDEX_HOMING_RETRY_ENABLE < 0) || (INDEX_HOMING_RETRY_ENABLE > 1)
+.error "INDEX_HOMING_RETRY_ENABLE must be 0 or 1"
+.endif
+.if (INDEX_HOMING_RETRY_COOLDOWN_SECONDS < 1) || (INDEX_HOMING_RETRY_COOLDOWN_SECONDS > 60)
+.error "INDEX_HOMING_RETRY_COOLDOWN_SECONDS must be in the range 1..60"
+.endif
 .if (INDEX_HOME_DELAY_MS < 0) || (INDEX_HOME_DELAY_MS > 60000)
 .error "INDEX_HOME_DELAY_MS must be in the range 0..60000 milliseconds"
 .endif
@@ -285,12 +299,11 @@
 .if (INDEX_POLE_PAIRS < 1) || (INDEX_POLE_PAIRS > 20)
 .error "INDEX_POLE_PAIRS must be in the range 1..20"
 .endif
-.if (INDEX_FOC_UPDATE_HZ < 100) || (INDEX_FOC_UPDATE_HZ > 2000)
-.error "INDEX_FOC_UPDATE_HZ must be in the range 100..2000 Hz"
+.if (INDEX_FOC_UPDATE_DIVIDER < 10) || (INDEX_FOC_UPDATE_DIVIDER > 200)
+.error "INDEX_FOC_UPDATE_DIVIDER must be in the range 10..200 (2000..100 Hz)"
 .endif
 .equ	INDEX_SETTLE_DELTA = 2		; Maximum motion on terminal release
 .equ	INDEX_TRACK_I_SHIFT = 5
-.equ	INDEX_DENSITY_MAX = 255
 .equ	INDEX_MINUTES_PER_REVOLUTION = 21600
 .equ	INDEX_HOME_DEADZONE_COUNTS = (INDEX_HOME_DEADZONE_MINUTES * 4096 + 10800) / INDEX_MINUTES_PER_REVOLUTION
 .if (INDEX_P_GAIN < 0) || (INDEX_P_GAIN > 255)
@@ -304,6 +317,9 @@
 .endif
 .if (INDEX_I_MAX < 1) || (INDEX_I_MAX > 28672)
 .error "INDEX_I_MAX must be in the range 1..28672"
+.endif
+.if (INDEX_HOME_OUTPUT_MAX < 1) || (INDEX_HOME_OUTPUT_MAX > 255)
+.error "INDEX_HOME_OUTPUT_MAX must be in the range 1..255"
 .endif
 .if (INDEX_HOME_DEADZONE_MINUTES < 0) || (INDEX_HOME_DEADZONE_MINUTES > 10800)
 .error "INDEX_HOME_DEADZONE_MINUTES must be in the range 0..10800"
@@ -349,10 +365,6 @@
 .if F_CPU % INDEX_PWM_CARRIER_HZ
 .error "INDEX_PWM_CARRIER_HZ must divide F_CPU exactly"
 .endif
-.if INDEX_PWM_CARRIER_HZ % INDEX_FOC_UPDATE_HZ
-.error "INDEX_FOC_UPDATE_HZ must divide the 20 kHz index carrier exactly"
-.endif
-.equ	INDEX_FOC_UPDATE_DIVIDER = INDEX_PWM_CARRIER_HZ / INDEX_FOC_UPDATE_HZ
 .if INDEX_CAL_DUTY_MAX >= INDEX_PWM_PERIOD_CYCLES
 .error "Index calibration duty must be shorter than the indexing PWM period"
 .endif
@@ -373,6 +385,9 @@
 .equ	INDEX_PWM_RUNNING = 5
 .equ	INDEX_CALIBRATING = 6
 .equ	INDEX_TARGET_AT_HOME = 7
+.equ	INDEX_PERSISTENT_MONITORING = 0
+.equ	INDEX_PERSISTENT_HOME_CAPTURED = 1
+.equ	INDEX_PERSISTENT_HOLD_REACHED = 2
 .equ	INDEX_CAL_BASE_HOLD = 1
 .equ	INDEX_CAL_ACQUIRE = 2
 .equ	INDEX_CAL_SWEEP_FORWARD = 3
@@ -546,6 +561,7 @@ i2c_blc_offset:	.byte	1
 .endif
 .if INDEX_ENABLE
 index_state:	.byte	1	; Post-run index state bits (definitions below)
+index_persistent_state: .byte 1 ; Persistent monitor, new-home, and continuous-hold flags
 index_wait_l:	.byte	1	; 4.096 ms Timer1-overflow ticks since throttle went low
 index_wait_h:	.byte	1
 index_delay_l:	.byte	1	; Selected homing/calibration delay in overflow ticks
@@ -3531,9 +3547,9 @@ i2c_init:
 .endif
 ;-----bko-----------------------------------------------------------------
 .if INDEX_ENABLE
-	; Indexing is deliberately reachable only after start_from_running has
-	; armed it. control_disarm clears the latch, which prevents startup indexing.
+	; Clear every index owner/latch when SimonK returns to its disarmed input wait.
 index_disarm:	sts	index_state, ZH
+		sts	index_persistent_state, ZH
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
 		rcall	index_foc_reset
@@ -3644,8 +3660,13 @@ index_calibrate_home:
 		sts	index_home_h, temp2
 		ldi	temp1, INDEX_HOME_MARKER
 		sts	index_home_valid, temp1
+		.if INDEX_PERSISTENT_HOMING
+		ldi	temp1, (1<<INDEX_PERSISTENT_HOME_CAPTURED)
+		sts	index_persistent_state, temp1
+		.endif
 		rjmp	index_calibrate_home_done
 index_calibrate_home_invalid:
+		sts	index_persistent_state, ZH
 		ldi	temp1, 0xff
 		sts	index_home_l, temp1
 		sts	index_home_h, temp1
@@ -3659,6 +3680,7 @@ index_calibrate_home_done:
 index_run_enter:
 		ldi	temp1, (1<<INDEX_ARMED)
 		sts	index_state, temp1
+		sts	index_persistent_state, ZH
 		sts	index_wait_l, ZH
 		sts	index_wait_h, ZH
 		rcall	index_foc_reset
@@ -3668,10 +3690,43 @@ index_run_enter:
 		out	TWCR, ZH
 		ret
 
+	; Called after the complete RC-ready tone sequence. Persistent mode schedules
+	; a startup home without requiring a prior motor run. A home captured during
+	; this same startup bypasses the normal coast delay so alignment starts as
+	; soon as the throttle/home EEPROM transaction and tones are complete.
+index_startup_enter:
+		.if INDEX_PERSISTENT_HOMING
+		lds	temp3, index_persistent_state
+		andi	temp3, (1<<INDEX_PERSISTENT_HOME_CAPTURED)
+		sts	index_persistent_state, ZH
+		ldi	temp1, (1<<INDEX_WAITING)
+		sts	index_state, temp1
+		sts	index_wait_l, ZH
+		sts	index_wait_h, ZH
+		out	TWCR, ZH
+		tst	temp3
+		brne	index_startup_delay_zero
+		rcall	index_electrical_is_valid
+		brcs	index_startup_calibration_delay
+		ldi2	temp1, temp2, INDEX_HOME_DELAY_TICKS
+		rjmp	index_startup_delay_store
+index_startup_calibration_delay:
+		ldi2	temp1, temp2, INDEX_CALIBRATION_DELAY_TICKS
+		rjmp	index_startup_delay_store
+index_startup_delay_zero:
+		clr	temp1
+		clr	temp2
+index_startup_delay_store:
+		sts	index_delay_l, temp1
+		sts	index_delay_h, temp2
+		.endif
+		ret
+
 index_stop_enter:
 		lds	temp1, index_state
 		sbrs	temp1, INDEX_ARMED
 		ret
+		sts	index_persistent_state, ZH
 		andi	temp1, (1<<INDEX_ARMED)
 		ori	temp1, (1<<INDEX_WAITING)
 		sts	index_state, temp1
@@ -3729,6 +3784,7 @@ index_home_preflight:
 		brcs	index_sensor_fault
 index_home_begin:
 		rcall	index_foc_reset
+		sts	index_persistent_state, ZH
 		lds	temp1, index_state
 		andi	temp1, 0xff-(1<<INDEX_CALIBRATING)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_TARGET_AT_HOME)
 		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)|(1<<INDEX_CONTROL_DUE)
@@ -3756,28 +3812,52 @@ index_home_begin:
 index_poll_ret:
 		ret
 index_sensor_fault:
-		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)-(1<<INDEX_TARGET_AT_HOME)
-		sts	index_state, temp1
-		rcall	switch_power_off
+		rcall	index_fault_stop
 		rcall	beep_f1			; AS5600 missing/unresponsive after stop delay
 		rcall	wait30ms
 		rcall	beep_f1
-		ret
+		rjmp	index_retry_after_fault
 index_home_missing:
-		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_WAITING)
-		sts	index_state, temp1
-		rcall	switch_power_off
+		rcall	index_fault_stop
 		rcall	beep_f1			; Home was not captured during throttle calibration
 		rcall	wait30ms
 		rcall	beep_f1
 		rcall	wait30ms
 		rcall	beep_f1
+		rjmp	index_retry_after_fault
+
+	; Every hard indexing error first removes all bridge ownership. Persistent
+	; retry, when enabled, then waits with the bridge off before a fresh sensor,
+	; calibration-record, and home preflight.
+index_fault_stop:
+		cbr	flags2, (1<<INDEX_DENSITY_PWM)
+		sts	index_persistent_state, ZH
+		lds	temp1, index_state
+		andi	temp1, (1<<INDEX_ARMED)
+		sts	index_state, temp1
+		sts	index_pwm_density, ZH
+		sts	index_q_command, ZH
+		rcall	switch_power_off
+		rcall	index_foc_reset
+		ldi	temp1, 0xff
+		sts	index_pwm_vector, temp1
+		out	TWCR, ZH
+		ret
+index_retry_after_fault:
+		.if INDEX_PERSISTENT_HOMING && INDEX_HOMING_RETRY_ENABLE
+		lds	temp1, index_state
+		ori	temp1, (1<<INDEX_WAITING)
+		sts	index_state, temp1
+		sts	index_wait_l, ZH
+		sts	index_wait_h, ZH
+		ldi2	temp1, temp2, INDEX_HOMING_RETRY_COOLDOWN_TICKS
+		sts	index_delay_l, temp1
+		sts	index_delay_h, temp2
+		.endif
 		ret
 
 	; Timer1 requests AS5600/control work every 4096 us. During homing, Timer2
-	; exclusively schedules SVM vector selection at INDEX_FOC_UPDATE_HZ; the
+	; exclusively schedules SVM selection at 20 kHz / INDEX_FOC_UPDATE_DIVIDER; the
 	; control update only publishes new angle/magnitude data for that scheduler.
 	; Throttle evaluation runs before this routine, so a new power command wins.
 index_service:
@@ -3801,23 +3881,65 @@ index_service_control:
 		andi	temp1, 0xff-(1<<INDEX_CONTROL_DUE)
 		sts	index_state, temp1
 		rcall	index_as5600_read
-		brcs	index_sensor_fault
+		brcc	index_service_read_ok
+		rjmp	index_sensor_fault
+index_service_read_ok:
 		rcall	index_as5600_magnet_detected
-		brcs	index_sensor_fault
+		brcc	index_service_magnet_ok
+		rjmp	index_sensor_fault
+index_service_magnet_ok:
 		lds	temp1, index_state
 		ori	temp1, (1<<INDEX_ANGLE_VALID)
 		sts	index_state, temp1
 		sbrc	temp1, INDEX_CALIBRATING
 		rjmp	index_calibration_step
+		.if INDEX_PERSISTENT_HOMING && INDEX_RESTART_HOMING_BEYOND_DEGREES
+		lds	temp2, index_persistent_state
+		sbrc	temp2, INDEX_PERSISTENT_MONITORING
+		rjmp	index_monitor_step
+		.endif
 		rcall	index_position_step
 		.if INDEX_DRIVE_ENABLE
 		rcall	index_foc_control_apply
 		.endif
 		ret
 
+	.if INDEX_PERSISTENT_HOMING && INDEX_RESTART_HOMING_BEYOND_DEGREES
+	; Successful homing leaves the bridge off but samples RAW_ANGLE every control
+	; period. Restart only after the shortest wrapped mechanical error is strictly
+	; outside the configured bilateral tolerance.
+index_monitor_step:
+		lds	temp3, index_home_l
+		lds	temp4, index_home_h
+		lds	temp1, index_angle_l
+		lds	temp2, index_angle_h
+		sub	temp3, temp1
+		sbc	temp4, temp2
+		andi	temp4, 0x0f
+		sbrs	temp4, 3
+		rjmp	index_monitor_absolute
+		ori	temp4, 0xf0
+		com	temp4
+		neg	temp3
+		sbci	temp4, 0xff
+index_monitor_absolute:
+		cpi	temp3, low(INDEX_RESTART_HOMING_BEYOND_COUNTS + 1)
+		ldi	temp1, high(INDEX_RESTART_HOMING_BEYOND_COUNTS + 1)
+		cpc	temp4, temp1
+		brlo	index_monitor_done
+		rjmp	index_home_preflight
+index_monitor_done:
+		ret
+	.endif
+
 	; Advance a mechanical target at the configured rate, then let the PID law
 	; track that target. Homing has its own elapsed-time watchdog.
 index_position_step:
+		.if INDEX_PERSISTENT_HOMING && (INDEX_RESTART_HOMING_BEYOND_DEGREES == 0)
+		lds	temp1, index_persistent_state
+		sbrc	temp1, INDEX_PERSISTENT_HOLD_REACHED
+		rjmp	index_position_within_time
+		.endif
 		lds	temp1, index_home_ticks_l
 		lds	temp2, index_home_ticks_h
 		subi	temp1, 0xff
@@ -3889,6 +4011,11 @@ index_pi_velocity_high_zero:
 		brlo	index_pi_settled
 		rjmp	index_pi_continue
 index_pi_settled:
+		.if INDEX_PERSISTENT_HOMING && (INDEX_RESTART_HOMING_BEYOND_DEGREES == 0)
+		ldi	temp1, (1<<INDEX_PERSISTENT_HOLD_REACHED)
+		sts	index_persistent_state, temp1
+		rjmp	index_pi_continue
+		.endif
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
 		rcall	index_home_complete
@@ -4146,11 +4273,32 @@ index_pi_magnitude:
 		tst	temp4
 		brne	index_pi_density_capped
 		mov	temp1, temp3
-		cpi	temp1, INDEX_DENSITY_MAX
+		cpi	temp1, INDEX_HOME_OUTPUT_MAX
 		brlo	index_pi_density_store
-		breq	index_pi_density_store
+		breq	index_pi_density_capped
 index_pi_density_capped:
-		ldi	temp1, INDEX_DENSITY_MAX
+	; Do not retain an integral update that pushes an already limited command
+	; farther into saturation. Opposite-signed error remains free to unwind it.
+		lds	temp2, index_previous_error_h
+		tst	YL
+		brne	index_pi_limit_negative
+		sbrc	temp2, 7
+		rjmp	index_pi_limit_store
+		rjmp	index_pi_limit_undo_integral
+index_pi_limit_negative:
+		sbrs	temp2, 7
+		rjmp	index_pi_limit_store
+index_pi_limit_undo_integral:
+		lds	temp1, index_integral_l
+		lds	temp2, index_integral_h
+		lds	temp3, index_previous_error_l
+		lds	temp4, index_previous_error_h
+		sub	temp1, temp3
+		sbc	temp2, temp4
+		sts	index_integral_l, temp1
+		sts	index_integral_h, temp2
+index_pi_limit_store:
+		ldi	temp1, INDEX_HOME_OUTPUT_MAX
 index_pi_density_store:
 		sts	index_foc_magnitude, temp1
 		ldi	temp3, 1
@@ -4346,7 +4494,7 @@ index_sector_done:
 	; second periodic SVM selection path. The only exceptions are immediate coast
 	; at a zero command and the one initial selection needed to start Timer2 from
 	; a stopped bridge. The latter resets the cadence so the next selection is one
-	; full INDEX_FOC_UPDATE_HZ period later.
+	; full configured vector-selection period later.
 index_foc_control_apply:
 		lds	temp1, index_q_command
 		tst	temp1
@@ -4365,7 +4513,7 @@ index_foc_control_start:
 		sts	index_foc_due, ZH
 		ret
 
-	; Error-diffuse the sine-weighted following-vector dwell at the 1 kHz SVM
+	; Error-diffuse the sine-weighted following-vector dwell at the configured SVM
 	; rate. The 20 kHz PDM density is simultaneously scaled by T1+T2, producing
 	; T1=Q*sin(60-alpha), T2=Q*sin(alpha), and a zero-vector remainder.
 index_foc_vector_step:
@@ -4428,9 +4576,9 @@ index_foc_sine_table:
 		.db	197, 239, 199, 238, 201, 236, 203, 235, 205, 234, 207, 233, 208, 231, 210, 230
 		.db	212, 229, 213, 227, 215, 226, 217, 224, 219, 223, 220, 221
 
-	; Home is a terminal state for this stopped cycle. Keep only the post-run
-	; armed latch; a later accepted throttle command starts normal SimonK and
-	; rearms the next high-to-low indexing event.
+	; Stop successful homing cleanly. In persistent mode with a nonzero restart
+	; tolerance, keep only the encoder service active: the bridge remains off until
+	; monitoring observes a wrapped mechanical error beyond that tolerance.
 index_home_complete:
 		sts	index_pwm_density, ZH
 		sts	index_q_command, ZH
@@ -4443,6 +4591,13 @@ index_home_complete:
 		sts	index_integral_h, ZH
 		lds	temp1, index_state
 		andi	temp1, (1<<INDEX_ARMED)
+		.if INDEX_PERSISTENT_HOMING && INDEX_RESTART_HOMING_BEYOND_DEGREES
+		ori	temp1, (1<<INDEX_ACTIVE)|(1<<INDEX_ANGLE_VALID)
+		ldi	temp2, (1<<INDEX_PERSISTENT_MONITORING)
+		sts	index_persistent_state, temp2
+		.else
+		sts	index_persistent_state, ZH
+		.endif
 		sts	index_state, temp1
 		ldi	temp1, 0xff
 		sts	index_pwm_vector, temp1
@@ -4462,7 +4617,7 @@ index_foc_reset:
 	; Five low pulses uniquely report that the rotor did not satisfy the normal
 	; home completion criteria before the trajectory watchdog expired.
 index_home_timeout:
-		rcall	index_home_complete
+		rcall	index_fault_stop
 		rcall	beep_f1
 		rcall	wait30ms
 		rcall	beep_f1
@@ -4472,7 +4627,7 @@ index_home_timeout:
 		rcall	beep_f1
 		rcall	wait30ms
 		rcall	beep_f1
-		ret
+		rjmp	index_retry_after_fault
 
 	; Use one fixed, current-limited waveform. A discarded six-vector revolution
 	; first acquires synchronism; geometry is then measured only at settled poles.
@@ -4988,12 +5143,9 @@ index_calibration_fail_return:
 index_calibration_fail_internal:
 		ldi	XL, INDEX_CAL_FAIL_INTERNAL
 index_calibration_failed:
-		cbr	flags2, (1<<INDEX_DENSITY_PWM)
-		lds	temp1, index_state
-		andi	temp1, 0xff-(1<<INDEX_WAITING)-(1<<INDEX_ACTIVE)-(1<<INDEX_ANGLE_VALID)-(1<<INDEX_CONTROL_DUE)-(1<<INDEX_PWM_RUNNING)-(1<<INDEX_CALIBRATING)-(1<<INDEX_TARGET_AT_HOME)
-		sts	index_state, temp1
-		rcall	switch_power_off
-		mov	YL, XL
+		push	XL
+		rcall	index_fault_stop
+		pop	YL
 index_calibration_failure_beep:
 		rcall	beep_f1
 		dec	YL
@@ -5001,7 +5153,7 @@ index_calibration_failure_beep:
 		rcall	wait30ms
 		rjmp	index_calibration_failure_beep
 index_calibration_failure_done:
-		ret
+		rjmp	index_retry_after_fault
 
 	; Issue TWCR command in temp1 and wait for TWINT. Carry is set on timeout.
 index_twi_wait:
@@ -5386,7 +5538,44 @@ index_six_step_change:
 		in	temp4, SREG
 		cli
 		push	temp4
+		clt				; T=1 below means the high-side source is unchanged
+		lds	temp1, index_state
+		sbrs	temp1, INDEX_PWM_RUNNING
+		rjmp	index_six_step_full_change
+		lds	temp1, index_pwm_vector
+		cpi	temp1, 6
+		brsh	index_six_step_full_change
+		; Source identity is ((vector + 1) / 2) modulo 3:
+		; A+ for 0/5, C+ for 1/2, and B+ for 3/4.
+		mov	temp2, temp1
+		inc	temp2
+		lsr	temp2
+		cpi	temp2, 3
+		brne	index_six_step_old_source_ready
+		clr	temp2
+index_six_step_old_source_ready:
+		mov	temp3, XL
+		inc	temp3
+		lsr	temp3
+		cpi	temp3, 3
+		brne	index_six_step_new_source_ready
+		clr	temp3
+index_six_step_new_source_ready:
+		cp	temp2, temp3
+		brne	index_six_step_full_change
+
+		; Adjacent vectors 1<->2, 3<->4, and 5<->0 share their source.
+		; Stop Timer2 and every low side, but do not discharge/recharge that source.
+		out	TCCR2, ZH
+		ldi	temp1, (1<<TOV2)
+		out	TIFR, temp1
+		ldi	ZL, low(pwm_wdr)
+		all_nFETs_off temp1
+		set
+		rjmp	index_six_step_break_before_make
+index_six_step_full_change:
 		rcall	switch_power_off
+index_six_step_break_before_make:
 		ldi	temp1, INDEX_DEADTIME_LOOPS
 index_six_step_break_delay:
 		dec	temp1
@@ -5407,6 +5596,7 @@ index_six_step_sink_b:
 		sbr	flags2, (1<<B_FET)
 
 index_six_step_source:
+		brts	index_six_step_source_ready	; Shared source is already fully enhanced
 		cpi	XL, 1
 		breq	index_six_step_source_c
 		cpi	XL, 2
@@ -5416,18 +5606,19 @@ index_six_step_source:
 		cpi	XL, 4
 		breq	index_six_step_source_b
 		ApFET_on			; Vectors 0 and 5: A+
-		rjmp	index_six_step_source_ready
+		rjmp	index_six_step_source_selected
 index_six_step_source_b:
 		BpFET_on			; Vectors 3 and 4: B+
-		rjmp	index_six_step_source_ready
+		rjmp	index_six_step_source_selected
 index_six_step_source_c:
 		CpFET_on			; Vectors 1 and 2: C+
-index_six_step_source_ready:
+index_six_step_source_selected:
 		ldi	temp1, INDEX_DEADTIME_LOOPS
 index_six_step_rise_delay:
 		dec	temp1
 		brne	index_six_step_rise_delay
 
+index_six_step_source_ready:
 		sts	index_pwm_vector, XL
 		lds	temp1, index_state
 		ori	temp1, (1<<INDEX_PWM_RUNNING)
@@ -5763,6 +5954,9 @@ i_rc_puls3:
 		rcall	beep_f4			; signal: rcpuls ready
 		rcall	beep_f4
 		rcall	beep_f4
+		.if INDEX_ENABLE
+		rcall	index_startup_enter	; Persistent mode may now schedule startup homing
+		.endif
 		cbr     flags0, (1<<RCP_ERROR)
 
 	; Fall through to restart_control
