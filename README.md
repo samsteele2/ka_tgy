@@ -11,10 +11,11 @@ For installation, normal operation, and fault-code checks, see
 > **Safety:** index mode controls voltage, not phase current. Use a
 > current-limited supply, begin below flight voltage, inspect all six gate
 > waveforms, and provide an immediate power disconnect. `INDEX_CAL_DUTY_MAX`
-> limits each calibration pulse to 8.0 us. Calibration emits at most one pulse
-> at 77/255 density (approximately 6.0 kHz effective, 4.8% average duty); this is not a
-> phase-current limit. `INDEX_HOME_OUTPUT_MAX` independently limits the homing
-> voltage command, but it is also not a phase-current limit.
+> limits each calibration pulse to 8.0 us. At the 16.8 V tuning reference,
+> calibration emits at 77/255 density (approximately 6.0 kHz effective and 4.8%
+> average duty). Voltage compensation can raise density to 123/255, but it does
+> not lengthen individual pulses. Neither this nor `INDEX_HOME_OUTPUT_MAX` is a
+> phase-current limit.
 
 ## System overview
 
@@ -26,6 +27,7 @@ For installation, normal operation, and fault-code checks, see
 | Position sensor | AS5600, 12-bit absolute angle, 400 kHz TWI |
 | Position/encoder update | 4.096 ms / 244.14 Hz |
 | Index drive | Voltage-mode sensored FOC; 434.8 Hz two-vector SVM, 20 kHz homing PDM |
+| Voltage feed-forward | PC2/ADC2; 16.8 V reference, 1.0x to approximately 1.6x |
 | Persistent behavior | Startup and post-run homing; bridge-off monitoring or continuous hold |
 | Persistent data | Mechanical home and electrical calibration in EEPROM |
 | Firmware image | `ka_nfet.hex` |
@@ -241,13 +243,48 @@ Those transitions retain the conservative all-six-off sequence, one
 selection does not change, neither side is commutated.
 
 With the current configuration, calibration uses fixed 8.0 us low-side pulses
-at approximately 6.0 kHz effective, for 4.8% average applied duty. Homing uses a
-separate fixed 3.5 us pulse, and an 8-bit modulo-255 accumulator varies its
-density from 0 through `INDEX_HOME_OUTPUT_MAX` frames at a 20 kHz carrier. The
-checked-in limit of 128 is approximately half of the previously available
-maximum pulse density. Its accumulator is preserved across adjacent-vector
-commutation so torque magnitude does not restart at every SVM update. Zero
-controller output coasts; indexing never applies dynamic braking.
+at approximately 6.0 kHz effective and 4.8% average applied duty at the 16.8 V
+tuning reference. Homing uses a separate fixed 3.5 us pulse, and an 8-bit
+modulo-255 accumulator controls its density at a 20 kHz carrier. Its accumulator
+is preserved across adjacent-vector commutation so torque magnitude does not
+restart at every SVM update. Zero controller output coasts; indexing never
+applies dynamic braking.
+
+### Input-voltage compensation
+
+Immediately before each calibration or homing attempt, with the bridge off, the
+firmware samples the battery divider on PC2/ADC2 using AVCC as its ADC reference.
+The configured 220k/51k divider produces approximately 3.162 V at the 16.8 V
+tuning voltage. It discards one settling conversion before using the second ADC
+result because this divider has relatively high source impedance. The
+feed-forward multiplier is:
+
+~~~text
+voltage_scale = clamp(16.8 V / measured_Vin, 1.0, 1.6)
+~~~
+
+The implementation uses a rounded Q7 multiplier. At 16.8 V the scale is 1.0.
+At 11.1 V the ideal 1.514 multiplier quantizes to approximately 1.516. Higher
+input voltage does not reduce output below the tuned setting, and low-voltage
+compensation is capped at approximately 1.6. The value is held for the duration
+of an attempt and is refreshed after a completed electrical calibration before
+homing begins. Because sampling occurs with the bridge off, it compensates pack
+voltage rather than transient loaded-voltage sag.
+
+For homing, this multiplier is applied once to the combined P+I-D command. This
+is mathematically equivalent to scaling all three gains but leaves the configured
+gains and integral state in their original tuning units. `INDEX_I_MAX` is not
+scaled: it limits accumulated position error, while its resulting voltage
+contribution is already scaled with the combined output. The nominal
+`INDEX_HOME_OUTPUT_MAX` limit is scaled as part of the command, and the physical
+8-bit modulation request is finally clamped at 255.
+
+Electrical calibration applies the same multiplier to its pulse density. At
+11.1 V, the checked-in 77/255 density becomes approximately 117/255. Its 8.0 us
+individual pulse-width ceiling remains unchanged, avoiding higher peak current
+from longer pulses. This is first-order bus-voltage feed-forward, not current
+regulation; winding current can still vary with resistance, inductance, load,
+gate drive, and supply impedance.
 
 ## Position-control specification
 
@@ -286,9 +323,10 @@ integral[k] = clamp(integral[k-1] + error[k], -I_MAX, I_MAX)
 u_raw = trunc(P * error[k])
       + trunc(I * trunc(integral[k] / 32))
       - trunc(D * velocity[k])
-if abs(u_raw) >= HOME_OUTPUT_MAX and sign(error[k]) == sign(u_raw):
+u_nominal = clamp(u_raw, -HOME_OUTPUT_MAX, HOME_OUTPUT_MAX)
+u = clamp(round(voltage_scale * u_nominal), -255, 255)
+if either clamp saturated and sign(error[k]) == sign(u_raw):
     integral[k] = integral[k-1]
-u = clamp(u_raw, -HOME_OUTPUT_MAX, HOME_OUTPUT_MAX)
 ```
 
 P, I, and D are configured in sixteenths. D acts on measured rotor movement
@@ -302,22 +340,25 @@ continuing in the old direction after the rotor crosses the moving target.
 Between crossings, `INDEX_I_MAX` bounds its magnitude.
 
 Once the target reaches home, the same law naturally becomes home-position PID
-control. The signed command is saturated symmetrically at
-`INDEX_HOME_OUTPUT_MAX`; the checked-in value is -128 through 128. Its magnitude
-sets the circular q-axis voltage request, and sine-weighted SVM converts that
-request to angle-dependent pulse density. Its sign selects torque direction.
-There is no stall counter, dead-zone inversion, learned minimum output, or
-homing breakaway pulse.
+control. At the 16.8 V reference, its nominal signed ceiling is
+`INDEX_HOME_OUTPUT_MAX`; the checked-in value is -196 through 196. Compensation
+scales that command at lower voltage and clamps the physical result to -255
+through 255. Its magnitude sets the circular q-axis voltage request, and
+sine-weighted SVM converts that request to angle-dependent pulse density. Its
+sign selects torque direction. There is no stall counter, dead-zone inversion,
+learned minimum output, or homing breakaway pulse.
 
 Current configured values are:
 
 | Setting | Value | Effective behavior |
 |---|---:|---|
 | `INDEX_P_GAIN` | 12 | P = 0.75 |
-| `INDEX_I_GAIN` | 2 | I = 0.125 |
+| `INDEX_I_GAIN` | 3 | I = 0.1875 |
 | `INDEX_D_GAIN` | 32 | D = 2.0 per measured encoder count/update |
-| `INDEX_I_MAX` | 16384 | Symmetric integral-accumulator clamp |
-| `INDEX_HOME_OUTPUT_MAX` | 128 | Symmetric final voltage-command ceiling; approximately 50% maximum pulse density |
+| `INDEX_I_MAX` | 20435 | Symmetric integral-accumulator clamp |
+| `INDEX_HOME_OUTPUT_MAX` | 196 | Nominal 16.8 V voltage-command ceiling before compensation |
+| `INDEX_VOLTAGE_REFERENCE_MV` | 16800 | Input voltage at which configured output is 100% |
+| `INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT` | 160 | Maximum feed-forward multiplier |
 | `INDEX_HOME_DEADZONE_MINUTES` | 180 | Approximately +/-3 degrees |
 | `INDEX_HOME_SLEW_RPM` | 60 | Mechanical target slew rate |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | 360 | Maximum target-to-rotor separation |
@@ -400,7 +441,11 @@ User-facing settings are in `ka_nfet.inc`:
 | `INDEX_FOC_UPDATE_DIVIDER` | 20 kHz carrier-frame divider for sine-weighted vector selection; 46 gives 434.78 Hz. Valid range is 10..200. |
 | `INDEX_P_GAIN`, `INDEX_I_GAIN`, `INDEX_D_GAIN` | Controller gains in sixteenths. D damps measured rotor motion. |
 | `INDEX_I_MAX` | Integral accumulator limit. |
-| `INDEX_HOME_OUTPUT_MAX` | Final symmetric homing-voltage magnitude, 1..255. It does not change calibration strength or the P/I/D gains. |
+| `INDEX_HOME_OUTPUT_MAX` | Nominal symmetric homing-voltage magnitude at the reference input, 1..255. The compensated physical request is clamped at 255. |
+| `INDEX_VOLTAGE_COMPENSATION_ENABLE` | Set to 1 to sample PC2 and compensate homing and calibration drive for input voltage. |
+| `INDEX_VOLTAGE_REFERENCE_MV` | Input voltage in millivolts at which configured index drive is 100%. |
+| `INDEX_ADC_REFERENCE_MV` | AVCC/ADC reference voltage in millivolts; checked in as 5000. |
+| `INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT` | Maximum low-voltage multiplier; checked in as 160%. |
 | `INDEX_HOME_DEADZONE_MINUTES` | Terminal +/- position window in angular minutes. |
 | `INDEX_HOME_SLEW_RPM` | Mechanical target slew rate toward home. |
 | `INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES` | Maximum target lead over the measured rotor. |

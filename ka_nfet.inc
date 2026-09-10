@@ -40,7 +40,11 @@
 .equ	INDEX_I_GAIN			= 3
 .equ	INDEX_D_GAIN			= 32
 .equ	INDEX_I_MAX				= 20435
-.equ	INDEX_HOME_OUTPUT_MAX	= 196	; Final homing-voltage ceiling, 1..255
+.equ	INDEX_HOME_OUTPUT_MAX	= 196	; Nominal at reference Vin; compensated output clamps at 255
+.equ	INDEX_VOLTAGE_COMPENSATION_ENABLE = 1 ; Scale index drive inversely with measured Vin
+.equ	INDEX_VOLTAGE_REFERENCE_MV = 16800 ; Voltage at which configured index output is 100%
+.equ	INDEX_ADC_REFERENCE_MV	= 5000	; AVCC/ADC reference used for the PC2 measurement
+.equ	INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT = 160 ; Maximum low-voltage drive multiplier
 .equ	INDEX_HOME_DEADZONE_MINUTES = 180 ; 180 = 3 degrees from home
 .equ	INDEX_HOME_SLEW_RPM		= 60	; Mechanical target speed toward home
 .equ	INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES = 360 ; Target-to-rotor safety bound
@@ -51,7 +55,7 @@
 ; gate waveform and phase current on the actual hardware. This is a hard ceiling
 ; and fixed pulse width for sparse calibration excitation. Homing uses its own
 ; fixed 3.5 us pulse in the separate 20 kHz pulse-density path.
-.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse at 6.0 kHz effective / 4.8% average duty
+.equ	INDEX_CAL_DUTY_MAX		= 128	; 8.0 us pulse ceiling; density is voltage-compensated
 .equ	INDEX_DEADTIME_US		= 5	; All-off delay around a six-step vector change
 
 ;*********************

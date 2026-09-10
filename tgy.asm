@@ -269,6 +269,23 @@
 .equ	INDEX_HOME_SLEW_STEP_FRACTION = low(INDEX_HOME_SLEW_STEP_Q8)
 .equ	INDEX_HOME_MAX_LEAD_COUNTS = (INDEX_HOME_MAX_LEAD_ELECTRICAL_DEGREES * 4096 + 180) / 360
 .equ	INDEX_RESTART_HOMING_BEYOND_COUNTS = (INDEX_RESTART_HOMING_BEYOND_DEGREES * 4096 + 180) / 360
+.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+.if !defined(mux_voltage)
+.error "Index voltage compensation requires mux_voltage"
+.endif
+; Full 10-bit ADC reference count and Q7 multiplier limits. The configured
+; 220k/51k divider produces approximately 3.162 V at 16.8 V input.
+.equ	INDEX_VOLTAGE_REFERENCE_ADC = (INDEX_VOLTAGE_REFERENCE_MV * O_GROUND * 1024 + ((O_POWER + O_GROUND) * INDEX_ADC_REFERENCE_MV / 2)) / ((O_POWER + O_GROUND) * INDEX_ADC_REFERENCE_MV)
+.equ	INDEX_VOLTAGE_SCALE_ONE_Q7 = 128
+.equ	INDEX_VOLTAGE_SCALE_MAX_Q7 = (INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT * 128 + 50) / 100
+.equ	INDEX_VOLTAGE_SCALE_MAX_ADC = (INDEX_VOLTAGE_REFERENCE_ADC * 128 + INDEX_VOLTAGE_SCALE_MAX_Q7 - 1) / INDEX_VOLTAGE_SCALE_MAX_Q7
+.if (INDEX_VOLTAGE_REFERENCE_ADC < 1) || (INDEX_VOLTAGE_REFERENCE_ADC > 1023)
+.error "INDEX_VOLTAGE_REFERENCE_MV is outside the 10-bit ADC range"
+.endif
+.if (INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT < 100) || (INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT > 199)
+.error "INDEX_VOLTAGE_COMPENSATION_MAX_PERCENT must be in the range 100..199"
+.endif
+.endif
 .if (INDEX_PERSISTENT_HOMING < 0) || (INDEX_PERSISTENT_HOMING > 1)
 .error "INDEX_PERSISTENT_HOMING must be 0 or 1"
 .endif
@@ -321,6 +338,9 @@
 .if (INDEX_HOME_OUTPUT_MAX < 1) || (INDEX_HOME_OUTPUT_MAX > 255)
 .error "INDEX_HOME_OUTPUT_MAX must be in the range 1..255"
 .endif
+.if (INDEX_VOLTAGE_COMPENSATION_ENABLE < 0) || (INDEX_VOLTAGE_COMPENSATION_ENABLE > 1)
+.error "INDEX_VOLTAGE_COMPENSATION_ENABLE must be 0 or 1"
+.endif
 .if (INDEX_HOME_DEADZONE_MINUTES < 0) || (INDEX_HOME_DEADZONE_MINUTES > 10800)
 .error "INDEX_HOME_DEADZONE_MINUTES must be in the range 0..10800"
 .endif
@@ -342,8 +362,8 @@
 .equ	INDEX_HOME_MARKER = 0xa5
 .equ	INDEX_ELECTRICAL_MARKER = 0x61	; CRC-protected aggregate sweep record
 
-; Calibration emits 77 pulses per 256 20 kHz frames. This is approximately 20%
-; stronger than the former 64/256 setting while retaining the same 8 us pulse
+; At the reference Vin, calibration emits 77 pulses per 256 20 kHz frames.
+; Voltage feed-forward scales this density while retaining the same 8 us pulse
 ; width and Timer2 timing margin. Homing remains on its independent 20 kHz path.
 .equ	INDEX_CAL_PULSE_DENSITY = 77
 .equ	INDEX_HOME_DUTY_MIN = MIN_DUTY
@@ -446,6 +466,9 @@
 ; Conditional code inclusion
 .set	DEBUG_TX	= 0		; Output debugging on UART TX pin
 .set	ADC_READ_NEEDED	= 0		; Reading from ADCs
+.if INDEX_ENABLE && INDEX_VOLTAGE_COMPENSATION_ENABLE
+.set	ADC_READ_NEEDED	= 1
+.endif
 
 ;**** **** **** **** ****
 ; Register Definitions
@@ -569,6 +592,9 @@ index_delay_h:	.byte	1
 index_angle_l:	.byte	1	; Last valid AS5600 mechanical angle, 0..4095
 index_angle_h:	.byte	1
 index_as5600_status: .byte 1	; STATUS sampled with the raw mechanical angle
+.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+index_voltage_scale_q7: .byte 1 ; Vin feed-forward multiplier: 128=1.0, max approximately 1.6
+.endif
 index_target_l: .byte 1	; Slewed mechanical position demand, 0..4095
 index_target_h: .byte 1
 index_target_fraction: .byte 1 ; Q8 rate remainder for four/five-count stepping
@@ -3574,6 +3600,70 @@ index_home_invalid:
 		sec
 		ret
 
+	.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+	; Sample PC2 with the bridge off and calculate round(16.8V/Vin) in Q7.
+	; Compensation never reduces configured drive above the reference voltage
+	; and is capped at the configured approximately-1.6 multiplier.
+index_voltage_compensation_update:
+		ldi	temp4, mux_voltage
+		rcall	adc_read		; Prime the sample capacitor through the high-value divider
+		rcall	adc_read		; Use the settled second conversion
+		cpi	temp1, low(INDEX_VOLTAGE_REFERENCE_ADC)
+		ldi	temp3, high(INDEX_VOLTAGE_REFERENCE_ADC)
+		cpc	temp2, temp3
+		brsh	index_voltage_compensation_one
+		cpi	temp1, low(INDEX_VOLTAGE_SCALE_MAX_ADC + 1)
+		ldi	temp3, high(INDEX_VOLTAGE_SCALE_MAX_ADC + 1)
+		cpc	temp2, temp3
+		brlo	index_voltage_compensation_max
+		movw	XL, temp1		; X = measured 10-bit ADC divisor
+		ldi3	temp3, temp4, YL, INDEX_VOLTAGE_REFERENCE_ADC * 128
+		mov	temp1, XL		; Add divisor/2 for rounded division
+		mov	temp2, XH
+		lsr	temp2
+		ror	temp1
+		add	temp3, temp1
+		adc	temp4, temp2
+		adc	YL, ZH
+		clr	YH			; Repeated-subtraction quotient, 128..204
+index_voltage_compensation_divide:
+		cp	temp3, XL
+		cpc	temp4, XH
+		cpc	YL, ZH
+		brcs	index_voltage_compensation_divided
+		sub	temp3, XL
+		sbc	temp4, XH
+		sbc	YL, ZH
+		inc	YH
+		rjmp	index_voltage_compensation_divide
+index_voltage_compensation_divided:
+		mov	temp1, YH
+		rjmp	index_voltage_compensation_store
+index_voltage_compensation_one:
+		ldi	temp1, INDEX_VOLTAGE_SCALE_ONE_Q7
+		rjmp	index_voltage_compensation_store
+index_voltage_compensation_max:
+		ldi	temp1, INDEX_VOLTAGE_SCALE_MAX_Q7
+index_voltage_compensation_store:
+		sts	index_voltage_scale_q7, temp1
+		ret
+
+	; Input temp1 is an unsigned nominal index command. Return the compensated
+	; value in temp2:temp1, rounded after multiplication by the stored Q7 scale.
+index_voltage_compensation_scale_u8:
+		lds	temp2, index_voltage_scale_q7
+		mul	temp1, temp2
+		ldi	temp3, 64
+		add	temp5, temp3
+		adc	temp6, ZH
+		lsl	temp5
+		rol	temp6
+		mov	temp1, temp6
+		clr	temp2
+		adc	temp2, ZH
+		ret
+	.endif
+
 	; Calculate CRC-16/CCITT (polynomial 0x1021, initial value 0xffff) over only
 	; the electrical payload. Mechanical home is deliberately outside this range:
 	; a damaged electrical record must trigger alignment and then use the stored
@@ -3773,8 +3863,14 @@ index_poll:	lds	temp1, index_state
 		brcs	index_home_missing
 		rcall	index_electrical_is_valid
 		brcc	index_home_preflight
+		.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+		rcall	index_voltage_compensation_update
+		.endif
 		rjmp	index_calibration_start
 index_home_preflight:
+		.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+		rcall	index_voltage_compensation_update
+		.endif
 		; Diagnostics are advisory: sound them with the bridge otherwise off,
 		; then refresh the raw angle because the tone can move the rotor slightly.
 		rcall	index_as5600_warn_status
@@ -4270,23 +4366,35 @@ index_pi_magnitude:
 		mov	temp1, temp3
 		or	temp1, temp4
 		breq	index_pi_zero
+		clr	XH			; XH marks nominal or compensated saturation
 		tst	temp4
-		brne	index_pi_density_capped
+		brne	index_pi_nominal_capped
 		mov	temp1, temp3
 		cpi	temp1, INDEX_HOME_OUTPUT_MAX
-		brlo	index_pi_density_store
-		breq	index_pi_density_capped
-index_pi_density_capped:
+		brlo	index_pi_nominal_ready
+index_pi_nominal_capped:
+		ldi	temp1, INDEX_HOME_OUTPUT_MAX
+		inc	XH
+index_pi_nominal_ready:
+		.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+		rcall	index_voltage_compensation_scale_u8
+		tst	temp2
+		breq	index_pi_compensated_ready
+		ldi	temp1, 0xff
+		inc	XH
+index_pi_compensated_ready:
+		.endif
+		mov	XL, temp1		; Preserve the final limited output across anti-windup
+		tst	XH
+		breq	index_pi_density_store
 	; Do not retain an integral update that pushes an already limited command
 	; farther into saturation. Opposite-signed error remains free to unwind it.
 		lds	temp2, index_previous_error_h
 		tst	YL
-		brne	index_pi_limit_negative
+		breq	index_pi_limit_sign_ready
+		com	temp2			; Normalize negative-output sign comparison
+index_pi_limit_sign_ready:
 		sbrc	temp2, 7
-		rjmp	index_pi_limit_store
-		rjmp	index_pi_limit_undo_integral
-index_pi_limit_negative:
-		sbrs	temp2, 7
 		rjmp	index_pi_limit_store
 index_pi_limit_undo_integral:
 		lds	temp1, index_integral_l
@@ -4298,7 +4406,7 @@ index_pi_limit_undo_integral:
 		sts	index_integral_l, temp1
 		sts	index_integral_h, temp2
 index_pi_limit_store:
-		ldi	temp1, INDEX_HOME_OUTPUT_MAX
+		mov	temp1, XL
 index_pi_density_store:
 		sts	index_foc_magnitude, temp1
 		ldi	temp3, 1
@@ -4634,6 +4742,9 @@ index_home_timeout:
 index_calibration_start:
 		sbr	flags2, (1<<INDEX_DENSITY_PWM)
 		ldi	temp1, INDEX_CAL_PULSE_DENSITY
+		.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+		rcall	index_voltage_compensation_scale_u8
+		.endif
 		sts	index_pwm_density, temp1
 		sts	index_pwm_accumulator, ZH
 		ldi2	temp1, temp2, INDEX_HOME_DUTY_MIN
@@ -5126,6 +5237,9 @@ index_calibration_commit_refresh_ok:
 		brcc	index_calibration_commit_refresh_magnet_ok
 		rjmp	index_sensor_fault
 index_calibration_commit_refresh_magnet_ok:
+		.if INDEX_VOLTAGE_COMPENSATION_ENABLE
+		rcall	index_voltage_compensation_update
+		.endif
 		rjmp	index_home_begin
 
 	; Low-beep counts are unique across index-mode failures: two sensor, three

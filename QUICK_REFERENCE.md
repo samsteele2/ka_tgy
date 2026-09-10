@@ -16,13 +16,17 @@ home and nearly stationary. It then turns the bridge off but continues monitorin
 the AS5600. If the rotor moves beyond +/-15 degrees from home, it starts another
 homing movement. A homing attempt is cancelled immediately by a new nonzero
 throttle command and is aborted if it takes longer than eight seconds. A hard
-failure leaves the bridge off for five seconds and then retries while zero
+failure leaves the bridge off for fifteen seconds and then retries while zero
 throttle remains commanded.
 
-The checked-in `INDEX_HOME_OUTPUT_MAX = 128` setting limits homing to
-approximately half of the modulation's available pulse density. This is a
-voltage-command ceiling, not measured phase-current protection. Electrical
-calibration uses its separate configured drive limit.
+Homing and calibration drive are tuned at 16.8 V and automatically compensated
+from the PC2 battery-voltage measurement. At 11.1 V the firmware applies
+approximately 1.516 times the nominal command; compensation cannot exceed
+approximately 1.6. The checked-in `INDEX_HOME_OUTPUT_MAX = 196` is the nominal
+homing ceiling at 16.8 V, and the compensated 8-bit command is clamped at 255.
+Calibration compensation increases pulse density but retains the 8.0 us
+individual pulse ceiling. These are voltage limits, not measured phase-current
+protection.
 
 The checked-in firmware is configured for a standard 12-slot, 14-pole motor
 (`INDEX_POLE_PAIRS = 7`). Electrical calibration aligns encoder direction and
